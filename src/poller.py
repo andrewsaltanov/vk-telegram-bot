@@ -158,15 +158,6 @@ class VKPoller:
     ):
         community_id = community["vk_id"]
 
-        if post_type == "published":
-            already_suggested = await self.db.get_post(post["id"], community_id, "suggested")
-            if already_suggested:
-                logger.info(
-                    f"Skip duplicate: vk_post_id={post['id']} community={community_id} "
-                    f"already sent as suggested (db_id={already_suggested['id']})"
-                )
-                return
-
         content = vk.extract_post_content(post)
         content["author_link"] = vk.get_author_link(post, community_id)
         content["post_link"] = vk.get_post_link(community_id, post["id"])
