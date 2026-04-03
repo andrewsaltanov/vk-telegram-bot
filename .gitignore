@@ -1,0 +1,20 @@
+# Секреты — никогда не коммитить
+.env
+communities.json
+
+# База данных
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Claude Code
+.claude/
+claude.md   

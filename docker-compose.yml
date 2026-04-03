@@ -1,0 +1,20 @@
+version: "3.9"
+
+services:
+  bot:
+    build: .
+    container_name: vk_tg_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./communities.json:/app/communities.json:ro
+    environment:
+      - DB_PATH=/app/data/bot.db
+      - COMMUNITIES_FILE=/app/communities.json
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
