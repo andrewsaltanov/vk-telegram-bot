@@ -680,6 +680,46 @@ async def cmd_queue(message: Message, db: Database, config: Config):
     )
 
 
+@router.message(Command("mute"))
+async def cmd_mute(message: Message, db: Database, config: Config):
+    if not _is_admin(message.from_user.id, config):
+        return
+    await _set_mute(message, db, config, muted=True)
+
+
+@router.message(Command("unmute"))
+async def cmd_unmute(message: Message, db: Database, config: Config):
+    if not _is_admin(message.from_user.id, config):
+        return
+    await _set_mute(message, db, config, muted=False)
+
+
+async def _set_mute(message: Message, db: Database, config: Config, muted: bool):
+    topic_id = message.message_thread_id
+    action = "отключены" if muted else "включены"
+
+    if topic_id:
+        community = await db.get_community_by_topic_id(topic_id)
+        if community:
+            await db.set_notifications_muted(community["vk_id"], muted)
+            await message.reply(
+                f"{'🔕' if muted else '🔔'} Уведомления о публикации "
+                f"<b>{action}</b> для «{community['name']}».",
+                parse_mode="HTML",
+            )
+            return
+        await message.reply("❌ Этот топик не привязан к сообществу.")
+        return
+
+    # General chat — show current states
+    communities = await db.get_communities()
+    lines = [f"{'🔕' if muted else '🔔'} Не в топике сообщества. Текущие настройки:\n"]
+    for c in communities:
+        state = "🔕 выкл" if c.get("notifications_muted") else "🔔 вкл"
+        lines.append(f"• {c['name']}: уведомления {state}")
+    await message.reply("\n".join(lines))
+
+
 @router.message(Command("help"))
 async def cmd_help(message: Message, config: Config):
     if not _is_admin(message.from_user.id, config):
@@ -689,6 +729,8 @@ async def cmd_help(message: Message, config: Config):
         "/status — состояние мониторинга\n"
         "/queue — очередь запланированных публикаций\n"
         "/autoqueue ЧЧ:ММ мин — массовое планирование постов из топика\n"
+        "/mute — отключить уведомления о публикации (в топике)\n"
+        "/unmute — включить уведомления о публикации (в топике)\n"
         "/help — эта справка\n\n"
         "<b>Планирование поста:</b>\n"
         "Нажми кнопку под постом в топике — выбери время или введи своё.",
