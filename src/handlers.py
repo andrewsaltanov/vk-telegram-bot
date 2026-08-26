@@ -684,17 +684,17 @@ async def cmd_queue(message: Message, db: Database, config: Config):
 async def cmd_mute(message: Message, db: Database, config: Config):
     if not _is_admin(message.from_user.id, config):
         return
-    await _set_mute(message, db, config, muted=True)
+    await _set_mute(message, db, muted=True)
 
 
 @router.message(Command("unmute"))
 async def cmd_unmute(message: Message, db: Database, config: Config):
     if not _is_admin(message.from_user.id, config):
         return
-    await _set_mute(message, db, config, muted=False)
+    await _set_mute(message, db, muted=False)
 
 
-async def _set_mute(message: Message, db: Database, config: Config, muted: bool):
+async def _set_mute(message: Message, db: Database, muted: bool):
     topic_id = message.message_thread_id
     action = "отключены" if muted else "включены"
 
@@ -713,7 +713,7 @@ async def _set_mute(message: Message, db: Database, config: Config, muted: bool)
 
     # General chat — show current states
     communities = await db.get_communities()
-    lines = [f"{'🔕' if muted else '🔔'} Не в топике сообщества. Текущие настройки:\n"]
+    lines = ["ℹ️ Не в топике сообщества. Текущие настройки:\n"]
     for c in communities:
         state = "🔕 выкл" if c.get("notifications_muted") else "🔔 вкл"
         lines.append(f"• {c['name']}: уведомления {state}")
