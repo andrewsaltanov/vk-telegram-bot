@@ -1,7 +1,9 @@
 import json
 import os
 from dataclasses import dataclass
+from functools import cached_property
 from typing import List
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
@@ -34,6 +36,10 @@ class Config:
             if c.group_id == group_id:
                 return c
         return None
+
+    @cached_property
+    def tz(self) -> ZoneInfo:
+        return ZoneInfo(self.TIMEZONE)
 
 
 def load_config() -> Config:

@@ -4,6 +4,9 @@ from typing import Optional, List
 
 logger = logging.getLogger(__name__)
 
+# Default "nearby schedule" conflict window for get_pending_for_channel_near_time (±30 min).
+DEFAULT_CONFLICT_WINDOW_SECONDS = 1800
+
 
 class Database:
     def __init__(self, db_path: str):
@@ -347,7 +350,7 @@ class Database:
             return [dict(r) for r in await cur.fetchall()]
 
     async def get_pending_for_channel_near_time(
-        self, channel_id: int, schedule_ts: int, window: int = 1800
+        self, channel_id: int, schedule_ts: int, window: int = DEFAULT_CONFLICT_WINDOW_SECONDS
     ) -> List[dict]:
         """Pending posts for a channel within `window` seconds of schedule_ts."""
         async with self._conn.execute(

@@ -8,7 +8,6 @@ import html
 import json
 import logging
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
@@ -75,7 +74,7 @@ def _build_board_text(pending: list) -> str:
     if not pending:
         return "📅 Запланированных публикаций нет."
 
-    tz = ZoneInfo(_config.TIMEZONE)
+    tz = _config.tz
     lines = ["📅 <b>Очередь публикаций в канале:</b>"]
     for r in pending:
         t = datetime.fromtimestamp(r["schedule_time"], tz).strftime("%d.%m %H:%M")

@@ -2,7 +2,6 @@ import asyncio
 import logging
 import os
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -47,7 +46,7 @@ async def main():
     scheduler = create_scheduler(config.TIMEZONE)
     schedule_board.init(bot, db, config)
     init_scheduler(bot, db, config, refresh_board_fn=schedule_board.refresh_schedule_board)
-    now = datetime.now(ZoneInfo(config.TIMEZONE))
+    now = datetime.now(config.tz)
     await reload_pending_jobs(scheduler, db, now)
     scheduler.start()
     logger.info("APScheduler started")

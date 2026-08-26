@@ -168,7 +168,8 @@ class VKClient:
 
     # ── Content extraction ────────────────────────────────────────────────────
 
-    def extract_post_content(self, post: dict) -> dict:
+    @staticmethod
+    def extract_post_content(post: dict) -> dict:
         """Extract all relevant content from a VK post."""
         text = post.get("text", "")
         photos: List[str] = []
@@ -225,7 +226,8 @@ class VKClient:
             "docs": docs,
         }
 
-    def get_author_link(self, post: dict, community_id: int) -> str:
+    @staticmethod
+    def get_author_link(post: dict, community_id: int) -> str:
         from_id = post.get("from_id") or post.get("signer_id")
         if from_id:
             if from_id > 0:
@@ -234,5 +236,6 @@ class VKClient:
                 return f"https://vk.com/club{abs(from_id)}"
         return f"https://vk.com/club{abs(community_id)}"
 
-    def get_post_link(self, community_id: int, post_id: int) -> str:
+    @staticmethod
+    def get_post_link(community_id: int, post_id: int) -> str:
         return f"https://vk.com/wall-{abs(community_id)}_{post_id}"

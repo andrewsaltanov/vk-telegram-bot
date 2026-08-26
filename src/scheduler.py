@@ -9,13 +9,13 @@ import asyncio
 import json
 import logging
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.jobstores.memory import MemoryJobStore
 
 from keyboards import get_published_notification_keyboard
 from post_sender import send_post_to_channel
+from tg_utils import safe_call
 from vk_client import VKClient
 
 logger = logging.getLogger(__name__)
@@ -78,7 +78,7 @@ async def _check_vk_content(
             return saved_content, False, True
 
         # Post exists — extract fresh content and compare text
-        fresh_content = VKClient("").extract_post_content(post_data)
+        fresh_content = VKClient.extract_post_content(post_data)
         # Preserve metadata fields added at send time
         for key in ("post_link", "author_link", "community_name"):
             fresh_content[key] = saved_content.get(key, "")
@@ -132,20 +132,22 @@ async def execute_scheduled_post(record_id: int):
         if post_deleted:
             await _db.mark_scheduled_post_cancelled(record_id)
             logger.info(f"Record {record_id}: VK post deleted — cancelling publication")
-            try:
-                await _bot.send_message(
+            await safe_call(
+                _bot.send_message(
                     chat_id=_config.GROUP_ID,
                     text="🚫 Публикация отменена — пост удалён на VK",
                     message_thread_id=orig_post.get("tg_topic_id"),
                     reply_to_message_id=orig_post.get("tg_message_id"),
-                )
-            except Exception as e:
-                logger.warning(f"Could not send deletion notice: {e}")
+                ),
+                logger,
+                "Could not send deletion notice",
+            )
             if _refresh_board_fn:
-                try:
-                    await _refresh_board_fn(orig_post["community_id"])
-                except Exception:
-                    pass
+                await safe_call(
+                    _refresh_board_fn(orig_post["community_id"]),
+                    logger,
+                    "Could not refresh schedule board after deletion",
+                )
             return
 
     try:
@@ -167,10 +169,11 @@ async def execute_scheduled_post(record_id: int):
 
         # Refresh schedule board (remove this entry from the queue display)
         if orig_post and _refresh_board_fn:
-            try:
-                await _refresh_board_fn(orig_post["community_id"])
-            except Exception as board_err:
-                logger.warning(f"Could not refresh schedule board: {board_err}")
+            await safe_call(
+                _refresh_board_fn(orig_post["community_id"]),
+                logger,
+                "Could not refresh schedule board",
+            )
 
         # Send notification to GROUP topic
         community = await _db.get_community(orig_post["community_id"]) if orig_post else None
@@ -182,12 +185,12 @@ async def execute_scheduled_post(record_id: int):
             ch_id_str = str(abs(channel_id))[3:] if channel_id < 0 else str(channel_id)
             link = f"https://t.me/c/{ch_id_str}/{channel_msg_id}"
 
-            tz = ZoneInfo(_config.TIMEZONE)
+            tz = _config.tz
             time_str = datetime.now(tz).strftime("%d.%m.%Y %H:%M")
             update_line = "\n📝 Текст обновился на VK — опубликована актуальная версия" if content_was_updated else ""
 
-            try:
-                await _bot.send_message(
+            await safe_call(
+                _bot.send_message(
                     chat_id=_config.GROUP_ID,
                     text=f'📢 Опубликовано в канале {time_str}{update_line}\n<a href="{link}">Ссылка на пост</a>',
                     parse_mode="HTML",
@@ -195,9 +198,10 @@ async def execute_scheduled_post(record_id: int):
                     reply_to_message_id=orig_post.get("tg_message_id"),
                     reply_markup=get_published_notification_keyboard(record_id),
                     disable_web_page_preview=True,
-                )
-            except Exception as notify_err:
-                logger.warning(f"Could not send publish notification: {notify_err}")
+                ),
+                logger,
+                "Could not send publish notification",
+            )
 
     except Exception as e:
         logger.error(f"Failed to send scheduled post {record_id}: {e}")

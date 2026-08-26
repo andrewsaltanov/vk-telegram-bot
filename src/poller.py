@@ -20,6 +20,13 @@ from vk_client import VKClient
 
 logger = logging.getLogger(__name__)
 
+# Delays between VK API calls to stay under VK's rate limit (error 6/29 = "too many requests").
+BETWEEN_COMMUNITIES_DELAY = 1
+BETWEEN_WALL_TYPES_DELAY = 0.5
+BETWEEN_SENT_POSTS_DELAY = 2
+BETWEEN_DELETION_CHECKS_DELAY = 1
+BETWEEN_JOB_CANCELS_DELAY = 0.1
+
 
 class VKPoller:
     def __init__(self, bot: Bot, db: Database, config: Config, scheduler: AsyncIOScheduler):
@@ -62,12 +69,12 @@ class VKPoller:
                 logger.error(
                     f"Error polling community {community['vk_id']}: {e}", exc_info=True
                 )
-            await asyncio.sleep(1)  # VK rate limit
+            await asyncio.sleep(BETWEEN_COMMUNITIES_DELAY)
 
     async def _poll_community(self, vk: VKClient, community: dict):
         if community.get("published_topic_id"):
             await self._poll_wall(vk, community, "published")
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(BETWEEN_WALL_TYPES_DELAY)
         if community.get("suggested_topic_id"):
             await self._poll_wall(vk, community, "suggested")
 
@@ -122,7 +129,7 @@ class VKPoller:
                     await self.db.clear_community_topic(community_id, post_type)
                     return  # skip remaining posts for this topic
                 raise
-            await asyncio.sleep(2)
+            await asyncio.sleep(BETWEEN_SENT_POSTS_DELAY)
 
         # Detect deleted posts
         current_vk_ids = {p["id"] for p in vk_posts}
@@ -153,7 +160,7 @@ class VKPoller:
                 exists = await vk.post_exists(community["vk_id"], stored["vk_post_id"])
                 if not exists:
                     await self._handle_deleted(stored)
-                await asyncio.sleep(1)  # Avoid VK rate limit (error 29)
+                await asyncio.sleep(BETWEEN_DELETION_CHECKS_DELAY)
 
     # ── Send single post ──────────────────────────────────────────────────────
 
@@ -238,7 +245,7 @@ class VKPoller:
                 except JobLookupError:
                     pass  # Already fired or never added
             await self.db.mark_scheduled_post_cancelled(sched["id"])
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(BETWEEN_JOB_CANCELS_DELAY)
 
         # 3. Remove from DB (cascade deletes scheduled_channel_posts)
         await self.db.delete_post_by_id(post_id)

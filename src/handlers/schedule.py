@@ -1,37 +1,29 @@
 """
-Telegram bot handlers: schedule callbacks, FSM for custom time, admin commands.
-Uses APScheduler (aiogram 3.7) — no Telegram-side scheduling.
+Scheduling flow: pick a time (preset or custom), persist an APScheduler job,
+reschedule, cancel, and bulk-autoqueue posts from a topic.
 """
 import json
 import logging
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 
 from aiogram import Router, Bot
-from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
+from aiogram.types import CallbackQuery, Message
 from apscheduler.jobstores.base import JobLookupError
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-
-from callbacks import (
-    CancelSchedCallback,
-    DelChannelCallback,
-    ManualDoneCallback,
-    ManualInfoCallback,
-    RescheduleCallback,
-    ScheduleCallback,
-    SchedInfoCallback,
-)
+from callbacks import CancelSchedCallback, RescheduleCallback, ScheduleCallback, SchedInfoCallback
 from config import Config
 from database import Database
-from keyboards import get_schedule_keyboard, get_scheduled_badge, get_manually_placed_badge
+from filters import IsAdmin
+from keyboards import get_schedule_keyboard, get_scheduled_badge
 from schedule_board import refresh_schedule_board
 from scheduler import execute_scheduled_post
+from tg_utils import safe_call
+
+from .common import _notify, _require_admin
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -53,8 +45,7 @@ async def handle_schedule_callback(
     config: Config,
     scheduler: AsyncIOScheduler,
 ):
-    if not _is_admin(callback.from_user.id, config):
-        await callback.answer("⛔️ Нет доступа", show_alert=True)
+    if not await _require_admin(callback, config):
         return
 
     post_db_id = callback_data.post_db_id
@@ -74,7 +65,7 @@ async def handle_schedule_callback(
         return
 
     minutes = int(option)
-    tz = ZoneInfo(config.TIMEZONE)
+    tz = config.tz
     # minutes=0 means "now" → delay 30 seconds
     delay = timedelta(seconds=30) if minutes == 0 else timedelta(minutes=minutes)
     schedule_time = datetime.now(tz) + delay
@@ -93,7 +84,7 @@ async def handle_custom_time_input(
     text = (message.text or "").strip()
     data = await state.get_data()
     post_db_id = data.get("post_db_id")
-    tz = ZoneInfo(config.TIMEZONE)
+    tz = config.tz
     now = datetime.now(tz)
 
     schedule_time: datetime | None = None
@@ -164,13 +155,6 @@ async def _schedule_post_core(
     return record_id, int(schedule_time.timestamp())
 
 
-async def _notify(event: CallbackQuery | Message, text: str, alert: bool = False):
-    if isinstance(event, CallbackQuery):
-        await event.answer(text, show_alert=alert)
-    else:
-        await event.reply(text)
-
-
 async def _do_schedule(
     event: CallbackQuery | Message,
     db: Database,
@@ -196,22 +180,23 @@ async def _do_schedule(
         post["vk_post_id"], post["community_id"]
     )
     if prev:
-        tz = ZoneInfo(config.TIMEZONE)
+        tz = config.tz
         prev_time = datetime.fromtimestamp(prev["schedule_time"], tz).strftime("%d.%m.%Y %H:%M")
         prev_text = json.loads(prev["orig_content_json"]).get("text", "")
         curr_text = json.loads(post["content_json"]).get("text", "")
         warn_lines = [f"⚠️ Этот пост уже публиковался в канале {prev_time}."]
         if prev_text.strip() != curr_text.strip():
             warn_lines.append("📝 Текст изменился с момента публикации.")
-        try:
-            await bot.send_message(
+        await safe_call(
+            bot.send_message(
                 chat_id=config.GROUP_ID,
                 text="\n".join(warn_lines),
                 message_thread_id=post.get("tg_topic_id"),
                 reply_to_message_id=post.get("tg_message_id"),
-            )
-        except Exception as warn_err:
-            logger.warning(f"Could not send duplicate warning: {warn_err}")
+            ),
+            logger,
+            "Could not send duplicate warning",
+        )
         # Do NOT return — allow rescheduling
 
     is_suggested = post["post_type"] == "suggested"
@@ -224,19 +209,20 @@ async def _do_schedule(
     existing_ids = {ep["id"] for ep in existing_pending}
     conflicts = [c for c in nearby if c["id"] not in existing_ids]
     if conflicts:
-        tz = ZoneInfo(config.TIMEZONE)
+        tz = config.tz
         times = ", ".join(
             datetime.fromtimestamp(c["schedule_time"], tz).strftime("%H:%M")
             for c in conflicts
         )
-        try:
-            await bot.send_message(
+        await safe_call(
+            bot.send_message(
                 chat_id=config.GROUP_ID,
                 text=f"⚠️ Рядом уже запланировано в этом канале: {times} (±30 мин)",
                 message_thread_id=post.get("tg_topic_id"),
-            )
-        except Exception as conflict_err:
-            logger.warning(f"Could not send conflict warning: {conflict_err}")
+            ),
+            logger,
+            "Could not send conflict warning",
+        )
 
     try:
         record_id, unix_ts = await _schedule_post_core(
@@ -256,103 +242,42 @@ async def _do_schedule(
         tg_msg_id = post.get("tg_message_id")
         topic_id = post.get("tg_topic_id")
         if tg_msg_id:
-            try:
-                await bot.edit_message_reply_markup(
+            await safe_call(
+                bot.edit_message_reply_markup(
                     chat_id=config.GROUP_ID,
                     message_id=tg_msg_id,
                     reply_markup=get_scheduled_badge(post_db_id, unix_ts, config.TIMEZONE, record_id=record_id),
-                )
-            except Exception as edit_err:
-                logger.warning(f"Could not update keyboard for post {post_db_id}: {edit_err}")
+                ),
+                logger,
+                f"Could not update keyboard for post {post_db_id}",
+            )
 
         # 5. Send reply marker in the topic
-        try:
-            await bot.send_message(
+        await safe_call(
+            bot.send_message(
                 chat_id=config.GROUP_ID,
                 text=f"✅ Запланировано на {time_str}",
                 message_thread_id=topic_id,
                 reply_to_message_id=tg_msg_id,
-            )
-        except Exception as reply_err:
-            logger.warning(f"Could not send schedule marker for post {post_db_id}: {reply_err}")
+            ),
+            logger,
+            f"Could not send schedule marker for post {post_db_id}",
+        )
 
         # 6. Update the schedule board in the topic
         if community:
-            try:
-                await refresh_schedule_board(community["vk_id"])
-            except Exception as board_err:
-                logger.warning(f"Could not refresh schedule board: {board_err}")
+            await safe_call(
+                refresh_schedule_board(community["vk_id"]),
+                logger,
+                "Could not refresh schedule board",
+            )
 
     except Exception as e:
         logger.error(f"Schedule error: {e}")
         await _notify(event, f"❌ Ошибка планирования: {e}", alert=True)
 
 
-# ── Manual placement callbacks ────────────────────────────────────────────────
-
-@router.callback_query(ManualDoneCallback.filter())
-async def handle_manual_done(
-    callback: CallbackQuery,
-    callback_data: ManualDoneCallback,
-    db: Database,
-    bot: Bot,
-    config: Config,
-):
-    if not _is_admin(callback.from_user.id, config):
-        await callback.answer("⛔️ Нет доступа", show_alert=True)
-        return
-
-    post = await db.get_post_by_id(callback_data.post_db_id)
-    if not post:
-        await callback.answer("❌ Пост не найден", show_alert=True)
-        return
-
-    tz = ZoneInfo(config.TIMEZONE)
-    unix_ts = int(datetime.now(tz).timestamp())
-    time_str = datetime.fromtimestamp(unix_ts, tz=tz).strftime("%d.%m.%Y %H:%M")
-
-    await callback.answer(f"✅ Отмечен как размещённый вручную {time_str}", show_alert=True)
-
-    tg_msg_id = post.get("tg_message_id")
-    topic_id = post.get("tg_topic_id")
-
-    if tg_msg_id:
-        try:
-            await bot.edit_message_reply_markup(
-                chat_id=config.GROUP_ID,
-                message_id=tg_msg_id,
-                reply_markup=get_manually_placed_badge(callback_data.post_db_id, unix_ts, config.TIMEZONE),
-            )
-        except Exception as e:
-            logger.warning(f"Could not update keyboard for post {callback_data.post_db_id}: {e}")
-
-    try:
-        await bot.send_message(
-            chat_id=config.GROUP_ID,
-            text=f"✅ Размещён вручную {time_str}",
-            message_thread_id=topic_id,
-            reply_to_message_id=tg_msg_id,
-        )
-    except Exception as e:
-        logger.warning(f"Could not send manual marker for post {callback_data.post_db_id}: {e}")
-
-
-@router.callback_query(ManualInfoCallback.filter())
-async def handle_manual_info(
-    callback: CallbackQuery,
-    callback_data: ManualInfoCallback,
-    config: Config,
-):
-    tz = ZoneInfo(config.TIMEZONE)
-    dt = datetime.fromtimestamp(callback_data.unix_ts, tz=tz)
-    time_str = dt.strftime("%d.%m.%Y %H:%M")
-    await callback.answer(
-        f"Размещён вручную {time_str} ({config.TIMEZONE})",
-        show_alert=True,
-    )
-
-
-# ── Scheduled badge callbacks ─────────────────────────────────────────────────
+# ── Scheduled badge callback ──────────────────────────────────────────────────
 
 @router.callback_query(SchedInfoCallback.filter())
 async def handle_scheduled_info(
@@ -360,7 +285,7 @@ async def handle_scheduled_info(
     callback_data: SchedInfoCallback,
     config: Config,
 ):
-    tz = ZoneInfo(config.TIMEZONE)
+    tz = config.tz
     dt = datetime.fromtimestamp(callback_data.unix_ts, tz=tz)
     time_str = dt.strftime("%d.%m.%Y %H:%M")
     await callback.answer(
@@ -379,8 +304,7 @@ async def handle_cancel_sched(
     config: Config,
     scheduler: AsyncIOScheduler,
 ):
-    if not _is_admin(callback.from_user.id, config):
-        await callback.answer("⛔️ Нет доступа", show_alert=True)
+    if not await _require_admin(callback, config):
         return
 
     record = await db.get_scheduled_post_record(callback_data.record_id)
@@ -400,10 +324,11 @@ async def handle_cancel_sched(
     # Refresh board so cancelled post disappears from the queue display
     post = await db.get_post_by_id(record["post_id"])
     if post:
-        try:
-            await refresh_schedule_board(post["community_id"])
-        except Exception as board_err:
-            logger.warning(f"Could not refresh schedule board after cancel: {board_err}")
+        await safe_call(
+            refresh_schedule_board(post["community_id"]),
+            logger,
+            "Could not refresh schedule board after cancel",
+        )
 
 
 # ── Reschedule ───────────────────────────────────────────────────────────────
@@ -416,8 +341,7 @@ async def handle_reschedule(
     bot: Bot,
     config: Config,
 ):
-    if not _is_admin(callback.from_user.id, config):
-        await callback.answer("⛔️ Нет доступа", show_alert=True)
+    if not await _require_admin(callback, config):
         return
 
     post = await db.get_post_by_id(callback_data.post_db_id)
@@ -442,40 +366,9 @@ async def handle_reschedule(
         await callback.answer("❌ Не удалось открыть пикер времени", show_alert=True)
 
 
-# ── Delete from channel ───────────────────────────────────────────────────────
-
-@router.callback_query(DelChannelCallback.filter())
-async def handle_del_channel(
-    callback: CallbackQuery,
-    callback_data: DelChannelCallback,
-    db: Database,
-    bot: Bot,
-    config: Config,
-):
-    if not _is_admin(callback.from_user.id, config):
-        await callback.answer("⛔️ Нет доступа", show_alert=True)
-        return
-
-    record = await db.get_scheduled_post_record(callback_data.record_id)
-    if not record:
-        await callback.answer("Запись не найдена", show_alert=True)
-        return
-    channel_msg_id = record.get("channel_message_id")
-    if channel_msg_id:
-        try:
-            await bot.delete_message(
-                chat_id=record["channel_id"],
-                message_id=channel_msg_id,
-            )
-        except TelegramBadRequest as e:
-            logger.warning(f"Could not delete channel message: {e}")
-    await callback.message.edit_text("🗑 Удалено из канала", reply_markup=None)
-    await callback.answer("Удалено")
-
-
 # ── Autoqueue ─────────────────────────────────────────────────────────────────
 
-@router.message(Command("autoqueue"))
+@router.message(Command("autoqueue"), IsAdmin())
 async def cmd_autoqueue(
     message: Message,
     db: Database,
@@ -483,9 +376,6 @@ async def cmd_autoqueue(
     scheduler: AsyncIOScheduler,
     bot: Bot,
 ):
-    if not _is_admin(message.from_user.id, config):
-        return
-
     topic_id = message.message_thread_id
     if not topic_id:
         await message.reply("❌ Команда должна использоваться внутри топика сообщества.")
@@ -501,7 +391,7 @@ async def cmd_autoqueue(
         )
         return
 
-    tz = ZoneInfo(config.TIMEZONE)
+    tz = config.tz
     now = datetime.now(tz)
     try:
         t = datetime.strptime(args[0], "%H:%M")
@@ -559,16 +449,17 @@ async def cmd_autoqueue(
             )
             # Update the post's keyboard to show scheduled badge
             if post.get("tg_message_id"):
-                try:
-                    await bot.edit_message_reply_markup(
+                await safe_call(
+                    bot.edit_message_reply_markup(
                         chat_id=config.GROUP_ID,
                         message_id=post["tg_message_id"],
                         reply_markup=get_scheduled_badge(
                             post["id"], unix_ts, config.TIMEZONE, record_id=record_id
                         ),
-                    )
-                except Exception:
-                    pass
+                    ),
+                    logger,
+                    f"autoqueue: could not update keyboard for post {post['id']}",
+                )
 
             text_preview = json.loads(post["content_json"]).get("text", "")[:40]
             time_str = current_time.strftime("%H:%M")
@@ -580,158 +471,13 @@ async def cmd_autoqueue(
             scheduled_lines.append(f"• ❌ Ошибка: {post['id']}")
 
     # Refresh board once after bulk scheduling
-    try:
-        await refresh_schedule_board(community["vk_id"])
-    except Exception:
-        pass
+    await safe_call(
+        refresh_schedule_board(community["vk_id"]),
+        logger,
+        "autoqueue: could not refresh schedule board",
+    )
 
     count = len(posts)
     summary = f"✅ Запланировано {count} постов:\n" + "\n".join(scheduled_lines)
     await message.reply(summary)
     logger.info(f"autoqueue: scheduled {count} posts for community {community['vk_id']}")
-
-
-# ── Admin commands ─────────────────────────────────────────────────────────────
-
-def _is_admin(user_id: int, config: Config) -> bool:
-    # Empty ADMIN_IDS = unrestricted (open bot). Set ADMIN_IDS in .env to restrict.
-    return not config.ADMIN_IDS or user_id in config.ADMIN_IDS
-
-
-@router.message(Command("status"))
-async def cmd_status(message: Message, db: Database, config: Config):
-    if not _is_admin(message.from_user.id, config):
-        return
-    communities = await db.get_communities()
-    if not communities:
-        await message.reply("Сообщества не настроены.")
-        return
-
-    tz = ZoneInfo(config.TIMEZONE)
-    week_ago = int((datetime.now(tz) - timedelta(days=7)).timestamp())
-
-    # Build a map of community_id → next pending publication
-    all_pending = await db.get_all_pending_with_community()
-
-    lines = ["<b>Мониторинг сообществ:</b>"]
-    for c in communities:
-        community_id = c["vk_id"]
-        suggested_count = await db.get_pending_suggested_count(community_id)
-        published_week = await db.get_published_count_since(community_id, week_ago)
-
-        # Find next pending pub for this community from all_pending
-        community_pending = [
-            r for r in all_pending
-            if r["community_id"] == c["vk_id"]
-        ]
-        if community_pending:
-            next_ts = community_pending[0]["schedule_time"]
-            next_dt = datetime.fromtimestamp(next_ts, tz).strftime("%d.%m %H:%M")
-            sched_str = f"{len(community_pending)} пост(ов), ближайший: {next_dt}"
-        else:
-            sched_str = "нет"
-
-        lines.append(
-            f"\n🔹 <b>{c['name']}</b>\n"
-            f"   Публикации: топик #{c['published_topic_id']} | последний пост {c['last_post_id']}\n"
-            f"   Предложки: топик #{c['suggested_topic_id']} | ожидает: {suggested_count}\n"
-            f"   Запланировано: {sched_str}\n"
-            f"   Опубликовано за 7 дней: {published_week}"
-        )
-
-    await message.reply("\n".join(lines), parse_mode="HTML")
-
-
-@router.message(Command("queue"))
-async def cmd_queue(message: Message, db: Database, config: Config):
-    if not _is_admin(message.from_user.id, config):
-        return
-    records = await db.get_all_pending_with_community()
-    if not records:
-        await message.reply("📅 Запланированных публикаций нет.")
-        return
-
-    tz = ZoneInfo(config.TIMEZONE)
-    builder = InlineKeyboardBuilder()
-    lines = ["📅 <b>Запланированные публикации:</b>\n"]
-    for r in records:
-        t = datetime.fromtimestamp(r["schedule_time"], tz).strftime("%d.%m %H:%M")
-        try:
-            text = json.loads(r["content_json"]).get("text", "").strip()
-        except (json.JSONDecodeError, TypeError):
-            text = ""
-        preview = text[:50] + ("…" if len(text) > 50 else "")
-        community = r["community_name"]
-        lines.append(f"• <b>{community}</b> — {t}")
-        if preview:
-            lines.append(f"  {preview}")
-        builder.row(
-            InlineKeyboardButton(
-                text=f"❌ Отменить {t}",
-                callback_data=CancelSchedCallback(record_id=r["id"]).pack(),
-            )
-        )
-
-    await message.reply(
-        "\n".join(lines),
-        parse_mode="HTML",
-        reply_markup=builder.as_markup(),
-    )
-
-
-@router.message(Command("mute"))
-async def cmd_mute(message: Message, db: Database, config: Config):
-    if not _is_admin(message.from_user.id, config):
-        return
-    await _set_mute(message, db, muted=True)
-
-
-@router.message(Command("unmute"))
-async def cmd_unmute(message: Message, db: Database, config: Config):
-    if not _is_admin(message.from_user.id, config):
-        return
-    await _set_mute(message, db, muted=False)
-
-
-async def _set_mute(message: Message, db: Database, muted: bool):
-    topic_id = message.message_thread_id
-    action = "отключены" if muted else "включены"
-
-    if topic_id:
-        community = await db.get_community_by_topic_id(topic_id)
-        if community:
-            await db.set_notifications_muted(community["vk_id"], muted)
-            await message.reply(
-                f"{'🔕' if muted else '🔔'} Уведомления о публикации "
-                f"<b>{action}</b> для «{community['name']}».",
-                parse_mode="HTML",
-            )
-            return
-        await message.reply("❌ Этот топик не привязан к сообществу.")
-        return
-
-    # General chat — show current states
-    communities = await db.get_communities()
-    lines = ["ℹ️ Не в топике сообщества. Текущие настройки:\n"]
-    for c in communities:
-        state = "🔕 выкл" if c.get("notifications_muted") else "🔔 вкл"
-        lines.append(f"• {c['name']}: уведомления {state}")
-    await message.reply("\n".join(lines))
-
-
-@router.message(Command("help"))
-async def cmd_help(message: Message, config: Config):
-    if not _is_admin(message.from_user.id, config):
-        return
-    await message.reply(
-        "<b>Команды бота:</b>\n\n"
-        "/status — состояние мониторинга\n"
-        "/queue — очередь запланированных публикаций\n"
-        "/autoqueue ЧЧ:ММ мин — массовое планирование постов из топика\n"
-        "/mute — отключить уведомления о публикации (в топике)\n"
-        "/unmute — включить уведомления о публикации (в топике)\n"
-        "/help — эта справка\n\n"
-        "<b>Планирование поста:</b>\n"
-        "Нажми кнопку под постом в топике — выбери время или введи своё.",
-        parse_mode="HTML",
-    )

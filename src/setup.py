@@ -9,6 +9,7 @@ from aiogram.exceptions import TelegramBadRequest
 
 from config import Config
 from database import Database
+from tg_utils import safe_call
 from vk_client import VKClient
 
 logger = logging.getLogger(__name__)
@@ -142,12 +143,13 @@ async def setup_communities(bot: Bot, db: Database, config: Config):
 
 
 async def _send_welcome(bot: Bot, chat_id: int, thread_id: int, text: str):
-    try:
-        await bot.send_message(
+    await safe_call(
+        bot.send_message(
             chat_id=chat_id,
             message_thread_id=thread_id,
             text=text,
             parse_mode="HTML",
-        )
-    except Exception as e:
-        logger.warning(f"Could not send welcome message to topic {thread_id}: {e}")
+        ),
+        logger,
+        f"Could not send welcome message to topic {thread_id}",
+    )
