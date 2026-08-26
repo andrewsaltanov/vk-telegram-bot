@@ -49,11 +49,19 @@ async def _check_vk_content(
     community_id: int,
     vk_post_id: int,
     saved_content: dict,
+    is_suggested: bool,
 ) -> tuple:
     """
     Fetches current VK content and compares with saved.
     Returns: (content_to_use, content_was_updated, post_was_deleted)
     Fail-open: on any error, returns saved_content unchanged.
+
+    A suggested post can vanish from VK not because it was withdrawn, but
+    because it was approved and moved onto the public wall under a different
+    post id — querying its original suggested-post id then looks identical to
+    a deletion. Since we can't tell the two apart from this API alone, a
+    missing/deleted suggested post is never cancelled — we just publish the
+    content we already captured.
     """
     if _config is None:
         return saved_content, False, False
@@ -74,6 +82,9 @@ async def _check_vk_content(
             return saved_content, False, False
 
         if post_data == {}:
+            if is_suggested:
+                # Likely approved onto the wall under a different id, not deleted.
+                return saved_content, False, False
             # Post was deleted from VK
             return saved_content, False, True
 
@@ -128,6 +139,7 @@ async def execute_scheduled_post(record_id: int):
             community_id=orig_post["community_id"],
             vk_post_id=orig_post["vk_post_id"],
             saved_content=content,
+            is_suggested=bool(record["is_suggested"]),
         )
         if post_deleted:
             await _db.mark_scheduled_post_cancelled(record_id)

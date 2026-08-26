@@ -149,7 +149,12 @@ class VKClient:
         if result is None:
             return True  # API error — assume exists to avoid false deletions
         items = result if isinstance(result, list) else result.get("items", [])
-        return bool(items)
+        if not items:
+            return False
+        # VK can return a non-empty stub for a deleted post (is_deleted=True,
+        # text replaced with a placeholder like "Пост удалён") instead of an
+        # empty item list — the flag is the only reliable deletion signal.
+        return not items[0].get("is_deleted")
 
     async def fetch_post_data(self, community_id: int, post_id: int) -> Optional[dict]:
         """
@@ -164,7 +169,14 @@ class VKClient:
         if result is None:
             return None  # API error — caller should fail-open
         items = result if isinstance(result, list) else result.get("items", [])
-        return items[0] if items else {}  # {} signals deleted
+        if not items:
+            return {}  # {} signals deleted
+        post = items[0]
+        # See post_exists() — VK can return a non-empty "deleted" stub with
+        # placeholder text instead of an empty item list.
+        if post.get("is_deleted"):
+            return {}
+        return post
 
     # ── Content extraction ────────────────────────────────────────────────────
 
