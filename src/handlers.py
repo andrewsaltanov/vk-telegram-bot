@@ -620,10 +620,9 @@ async def cmd_status(message: Message, db: Database, config: Config):
         published_week = await db.get_published_count_since(community_id, week_ago)
 
         # Find next pending pub for this community from all_pending
-        # all_pending rows have community_name but not community_id — use name match
         community_pending = [
             r for r in all_pending
-            if r["community_name"] == c["name"]
+            if r["community_id"] == c["vk_id"]
         ]
         if community_pending:
             next_ts = community_pending[0]["schedule_time"]

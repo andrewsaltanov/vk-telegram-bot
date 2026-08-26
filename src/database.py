@@ -336,7 +336,7 @@ class Database:
         async with self._conn.execute(
             """
             SELECT scp.id, scp.schedule_time, scp.content_json,
-                   c.name AS community_name
+                   c.name AS community_name, p.community_id AS community_id
             FROM scheduled_channel_posts scp
             JOIN posts p ON scp.post_id = p.id
             JOIN communities c ON p.community_id = c.vk_id
@@ -396,7 +396,7 @@ class Database:
             WHERE p.tg_topic_id = ?
               AND NOT EXISTS (
                   SELECT 1 FROM scheduled_channel_posts scp
-                  WHERE scp.post_id = p.id AND scp.status = 'pending'
+                  WHERE scp.post_id = p.id AND scp.status IN ('pending', 'sent')
               )
             ORDER BY p.vk_post_id ASC
             """,
@@ -405,9 +405,16 @@ class Database:
             return [dict(r) for r in await cur.fetchall()]
 
     async def get_pending_suggested_count(self, community_id: int) -> int:
-        """Count pending suggested posts for a community."""
+        """Count suggested posts for a community that have not yet been published."""
         async with self._conn.execute(
-            "SELECT COUNT(*) FROM posts WHERE community_id = ? AND post_type = 'suggested'",
+            """
+            SELECT COUNT(*) FROM posts p
+            WHERE p.community_id = ? AND p.post_type = 'suggested'
+              AND NOT EXISTS (
+                  SELECT 1 FROM scheduled_channel_posts scp
+                  WHERE scp.post_id = p.id AND scp.status = 'sent'
+              )
+            """,
             (community_id,),
         ) as cur:
             row = await cur.fetchone()
