@@ -606,15 +606,40 @@ async def cmd_status(message: Message, db: Database, config: Config):
     if not communities:
         await message.reply("Сообщества не настроены.")
         return
+
+    tz = ZoneInfo(config.TIMEZONE)
+    week_ago = int((datetime.now(tz) - timedelta(days=7)).timestamp())
+
+    # Build a map of community_id → next pending publication
+    all_pending = await db.get_all_pending_with_community()
+
     lines = ["<b>Мониторинг сообществ:</b>"]
     for c in communities:
+        community_id = c["vk_id"]
+        suggested_count = await db.get_pending_suggested_count(community_id)
+        published_week = await db.get_published_count_since(community_id, week_ago)
+
+        # Find next pending pub for this community from all_pending
+        # all_pending rows have community_name but not community_id — use name match
+        community_pending = [
+            r for r in all_pending
+            if r["community_name"] == c["name"]
+        ]
+        if community_pending:
+            next_ts = community_pending[0]["schedule_time"]
+            next_dt = datetime.fromtimestamp(next_ts, tz).strftime("%d.%m %H:%M")
+            sched_str = f"{len(community_pending)} пост(ов), ближайший: {next_dt}"
+        else:
+            sched_str = "нет"
+
         lines.append(
             f"\n🔹 <b>{c['name']}</b>\n"
-            f"   Публикации: топик #{c['published_topic_id']}, "
-            f"последний пост {c['last_post_id']}\n"
-            f"   Предложки: топик #{c['suggested_topic_id']}, "
-            f"последний {c['last_suggest_id']}"
+            f"   Публикации: топик #{c['published_topic_id']} | последний пост {c['last_post_id']}\n"
+            f"   Предложки: топик #{c['suggested_topic_id']} | ожидает: {suggested_count}\n"
+            f"   Запланировано: {sched_str}\n"
+            f"   Опубликовано за 7 дней: {published_week}"
         )
+
     await message.reply("\n".join(lines), parse_mode="HTML")
 
 
