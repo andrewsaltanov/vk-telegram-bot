@@ -151,6 +151,21 @@ class VKClient:
         items = result if isinstance(result, list) else result.get("items", [])
         return bool(items)
 
+    async def fetch_post_data(self, community_id: int, post_id: int) -> Optional[dict]:
+        """
+        Fetch full post data for content comparison.
+        Returns: dict with post data if found, {} if post was deleted, None if API error.
+        """
+        result = await self._call(
+            "wall.getById",
+            {"posts": f"-{abs(community_id)}_{post_id}"},
+            use_user_token=True,
+        )
+        if result is None:
+            return None  # API error — caller should fail-open
+        items = result if isinstance(result, list) else result.get("items", [])
+        return items[0] if items else {}  # {} signals deleted
+
     # ── Content extraction ────────────────────────────────────────────────────
 
     def extract_post_content(self, post: dict) -> dict:
