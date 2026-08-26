@@ -14,9 +14,7 @@ from callbacks import (
 )
 
 # Schedule options: (label, minutes)
-# minutes=0 → publish in 30 seconds ("Сейчас")
 SCHEDULE_OPTIONS = [
-    ("⚡️ Сейчас",  0),
     ("30 мин",     30),
     ("1 ч",        60),
     ("1.5 ч",      90),
@@ -32,6 +30,14 @@ SCHEDULE_OPTIONS = [
 
 def _schedule_rows(builder: InlineKeyboardBuilder, post_db_id: int) -> None:
     """Add schedule time option buttons (4 per row) and a custom-time row."""
+    # Full-width «Сейчас» button first
+    builder.row(
+        InlineKeyboardButton(
+            text="⚡️ Опубликовать сейчас",
+            callback_data=ScheduleCallback(post_db_id=post_db_id, option="0").pack(),
+        )
+    )
+    # Time-grid: 4 per row
     row: list[InlineKeyboardButton] = []
     for label, minutes in SCHEDULE_OPTIONS:
         row.append(
