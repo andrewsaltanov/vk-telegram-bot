@@ -17,6 +17,8 @@ class Database:
         "ALTER TABLE scheduled_channel_posts ADD COLUMN channel_message_id INTEGER",
         # v2 — add schedule_board_msg_id to communities (for per-topic queue board)
         "ALTER TABLE communities ADD COLUMN schedule_board_msg_id INTEGER",
+        # v3 — add notifications_muted to communities (for mute feature)
+        "ALTER TABLE communities ADD COLUMN notifications_muted INTEGER DEFAULT 0",
     ]
 
     async def connect(self):
@@ -358,3 +360,76 @@ class Database:
             (channel_id, schedule_ts, window),
         ) as cur:
             return [dict(r) for r in await cur.fetchall()]
+
+    # ── Content and analytics updates ──────────────────────────────────────────
+
+    async def update_post_content_json(self, post_id: int, content_json: str):
+        """Update a post's content_json."""
+        await self._conn.execute(
+            "UPDATE posts SET content_json = ? WHERE id = ?", (content_json, post_id)
+        )
+        await self._conn.commit()
+
+    async def update_scheduled_post_content_json(self, record_id: int, content_json: str):
+        """Update a scheduled post record's content_json."""
+        await self._conn.execute(
+            "UPDATE scheduled_channel_posts SET content_json = ? WHERE id = ?",
+            (content_json, record_id),
+        )
+        await self._conn.commit()
+
+    async def get_community_by_topic_id(self, topic_id: int) -> Optional[dict]:
+        """Find community by either published_topic_id or suggested_topic_id."""
+        async with self._conn.execute(
+            "SELECT * FROM communities WHERE published_topic_id = ? OR suggested_topic_id = ?",
+            (topic_id, topic_id),
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def get_unscheduled_posts_for_topic(self, topic_id: int) -> List[dict]:
+        """Posts in a topic that have no pending scheduled channel publication."""
+        async with self._conn.execute(
+            """
+            SELECT p.*
+            FROM posts p
+            WHERE p.tg_topic_id = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM scheduled_channel_posts scp
+                  WHERE scp.post_id = p.id AND scp.status = 'pending'
+              )
+            ORDER BY p.vk_post_id ASC
+            """,
+            (topic_id,),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def get_pending_suggested_count(self, community_id: int) -> int:
+        """Count pending suggested posts for a community."""
+        async with self._conn.execute(
+            "SELECT COUNT(*) FROM posts WHERE community_id = ? AND post_type = 'suggested'",
+            (community_id,),
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
+    async def get_published_count_since(self, community_id: int, since_ts: int) -> int:
+        """Count channel posts published (status='sent') since a unix timestamp."""
+        async with self._conn.execute(
+            """
+            SELECT COUNT(*) FROM scheduled_channel_posts scp
+            JOIN posts p ON scp.post_id = p.id
+            WHERE p.community_id = ? AND scp.status = 'sent' AND scp.schedule_time >= ?
+            """,
+            (community_id, since_ts),
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
+    async def set_notifications_muted(self, vk_id: int, muted: bool):
+        """Set the notifications_muted flag for a community."""
+        await self._conn.execute(
+            "UPDATE communities SET notifications_muted = ? WHERE vk_id = ?",
+            (int(muted), vk_id),
+        )
+        await self._conn.commit()
