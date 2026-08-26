@@ -27,6 +27,12 @@ BETWEEN_SENT_POSTS_DELAY = 2
 BETWEEN_DELETION_CHECKS_DELAY = 1
 BETWEEN_JOB_CANCELS_DELAY = 0.1
 
+# Cap on post_exists() calls per _check_deletions() invocation. A community with
+# a large deletion backlog (e.g. after fixing a detection bug) can otherwise stall
+# an entire poll cycle for tens of minutes, delaying new-post detection for every
+# community. Excess candidates are simply picked up again on the next poll cycle.
+MAX_DELETION_CHECKS_PER_CYCLE = 30
+
 
 class VKPoller:
     def __init__(self, bot: Bot, db: Database, config: Config, scheduler: AsyncIOScheduler):
@@ -153,14 +159,25 @@ class VKPoller:
         stored_posts = await self.db.get_posts_by_community(
             community["vk_id"], post_type
         )
-        for stored in stored_posts:
-            if stored["vk_post_id"] < min_vk_id:
-                continue  # Too old to appear in current batch — skip
-            if stored["vk_post_id"] not in current_vk_ids:
-                exists = await vk.post_exists(community["vk_id"], stored["vk_post_id"])
-                if not exists:
-                    await self._handle_deleted(stored)
-                await asyncio.sleep(BETWEEN_DELETION_CHECKS_DELAY)
+        candidates = [
+            s for s in stored_posts
+            if s["vk_post_id"] >= min_vk_id and s["vk_post_id"] not in current_vk_ids
+        ]
+        candidates.sort(key=lambda s: s["vk_post_id"])  # oldest first — drain backlog in order
+
+        to_check = candidates[:MAX_DELETION_CHECKS_PER_CYCLE]
+        deferred = len(candidates) - len(to_check)
+        if deferred:
+            logger.info(
+                f"Deletion check for community {community['vk_id']} ({post_type}): "
+                f"{deferred} candidate(s) deferred to next cycle"
+            )
+
+        for stored in to_check:
+            exists = await vk.post_exists(community["vk_id"], stored["vk_post_id"])
+            if not exists:
+                await self._handle_deleted(stored)
+            await asyncio.sleep(BETWEEN_DELETION_CHECKS_DELAY)
 
     # ── Send single post ──────────────────────────────────────────────────────
 
