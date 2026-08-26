@@ -124,6 +124,46 @@ async def handle_custom_time_input(
 
 # ── Core scheduling logic ──────────────────────────────────────────────────────
 
+async def _schedule_post_core(
+    db: Database,
+    scheduler: AsyncIOScheduler,
+    post_db_id: int,
+    channel_id: int,
+    content_json: str,
+    is_suggested: bool,
+    schedule_time: datetime,
+) -> tuple[int, int]:
+    """Persist a scheduled post record and add APScheduler job. Returns (record_id, unix_ts)."""
+    existing_pending = await db.get_pending_scheduled_for_post(post_db_id)
+    for ep in existing_pending:
+        job_id = ep.get("job_id")
+        if job_id:
+            try:
+                scheduler.remove_job(job_id)
+            except JobLookupError:
+                pass
+        await db.mark_scheduled_post_cancelled(ep["id"])
+
+    record_id = await db.save_scheduled_post_record(
+        post_id=post_db_id,
+        channel_id=channel_id,
+        content_json=content_json,
+        is_suggested=is_suggested,
+        schedule_time=int(schedule_time.timestamp()),
+    )
+    job_id = f"sched_{record_id}"
+    scheduler.add_job(
+        execute_scheduled_post,
+        trigger="date",
+        run_date=schedule_time,
+        args=[record_id],
+        id=job_id,
+        replace_existing=True,
+    )
+    await db.update_scheduled_post_job_id(record_id, job_id)
+    return record_id, int(schedule_time.timestamp())
+
+
 async def _notify(event: CallbackQuery | Message, text: str, alert: bool = False):
     if isinstance(event, CallbackQuery):
         await event.answer(text, show_alert=alert)
@@ -198,40 +238,16 @@ async def _do_schedule(
         except Exception as conflict_err:
             logger.warning(f"Could not send conflict warning: {conflict_err}")
 
-    for ep in existing_pending:
-        job_id = ep.get("job_id")
-        if job_id:
-            try:
-                scheduler.remove_job(job_id)
-            except JobLookupError:
-                pass
-        await db.mark_scheduled_post_cancelled(ep["id"])
-
     try:
-        # 1. Persist to DB so the job survives restarts
-        record_id = await db.save_scheduled_post_record(
-            post_id=post_db_id,
+        record_id, unix_ts = await _schedule_post_core(
+            db=db,
+            scheduler=scheduler,
+            post_db_id=post_db_id,
             channel_id=channel_id,
             content_json=post["content_json"],
             is_suggested=is_suggested,
-            schedule_time=int(schedule_time.timestamp()),
+            schedule_time=schedule_time,
         )
-
-        # 2. Add job to in-memory APScheduler
-        job_id = f"sched_{record_id}"
-        scheduler.add_job(
-            execute_scheduled_post,
-            trigger="date",
-            run_date=schedule_time,
-            args=[record_id],
-            id=job_id,
-            replace_existing=True,
-        )
-
-        # 3. Save job_id back to DB (for cancellation)
-        await db.update_scheduled_post_job_id(record_id, job_id)
-
-        unix_ts = int(schedule_time.timestamp())
         time_str = schedule_time.strftime("%d.%m.%Y %H:%M")
         await _notify(event, f"✅ Пост запланирован на {time_str}", alert=True)
         logger.info(f"Scheduled post {post_db_id} → channel {channel_id} at {time_str}")
@@ -457,6 +473,124 @@ async def handle_del_channel(
     await callback.answer("Удалено")
 
 
+# ── Autoqueue ─────────────────────────────────────────────────────────────────
+
+@router.message(Command("autoqueue"))
+async def cmd_autoqueue(
+    message: Message,
+    db: Database,
+    config: Config,
+    scheduler: AsyncIOScheduler,
+    bot: Bot,
+):
+    if not _is_admin(message.from_user.id, config):
+        return
+
+    topic_id = message.message_thread_id
+    if not topic_id:
+        await message.reply("❌ Команда должна использоваться внутри топика сообщества.")
+        return
+
+    # Parse args: /autoqueue HH:MM interval_minutes
+    args = (message.text or "").split()[1:]
+    if len(args) < 2:
+        await message.reply(
+            "❌ Использование: <code>/autoqueue ЧЧ:ММ интервал_мин</code>\n"
+            "Пример: <code>/autoqueue 09:00 60</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    tz = ZoneInfo(config.TIMEZONE)
+    now = datetime.now(tz)
+    try:
+        t = datetime.strptime(args[0], "%H:%M")
+        start_time = now.replace(hour=t.hour, minute=t.minute, second=0, microsecond=0)
+        if start_time <= now:
+            start_time += timedelta(days=1)
+        interval_min = int(args[1])
+        if interval_min <= 0:
+            raise ValueError("interval must be positive")
+    except (ValueError, IndexError):
+        await message.reply(
+            "❌ Неверный формат. Используйте: <code>/autoqueue ЧЧ:ММ интервал_мин</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    community = await db.get_community_by_topic_id(topic_id)
+    if not community:
+        await message.reply("❌ Этот топик не привязан ни к одному сообществу.")
+        return
+
+    channel_id = community.get("channel_id", 0)
+    if not channel_id:
+        await message.reply("❌ Канал для этого сообщества не настроен.")
+        return
+
+    posts = await db.get_unscheduled_posts_for_topic(topic_id)
+    if not posts:
+        await message.reply("ℹ️ Нет постов без расписания в этом топике.")
+        return
+
+    # If there are already pending posts for this channel, start after the last one
+    existing_pending = await db.get_pending_for_channel(channel_id)
+    if existing_pending:
+        last_ts = max(r["schedule_time"] for r in existing_pending)
+        last_dt = datetime.fromtimestamp(last_ts, tz)
+        candidate = last_dt + timedelta(minutes=interval_min)
+        if candidate > start_time:
+            start_time = candidate
+
+    scheduled_lines = []
+    current_time = start_time
+
+    for post in posts:
+        is_suggested = post["post_type"] == "suggested"
+        try:
+            record_id, unix_ts = await _schedule_post_core(
+                db=db,
+                scheduler=scheduler,
+                post_db_id=post["id"],
+                channel_id=channel_id,
+                content_json=post["content_json"],
+                is_suggested=is_suggested,
+                schedule_time=current_time,
+            )
+            # Update the post's keyboard to show scheduled badge
+            if post.get("tg_message_id"):
+                try:
+                    await bot.edit_message_reply_markup(
+                        chat_id=config.GROUP_ID,
+                        message_id=post["tg_message_id"],
+                        reply_markup=get_scheduled_badge(
+                            post["id"], unix_ts, config.TIMEZONE, record_id=record_id
+                        ),
+                    )
+                except Exception:
+                    pass
+
+            text_preview = json.loads(post["content_json"]).get("text", "")[:40]
+            time_str = current_time.strftime("%H:%M")
+            scheduled_lines.append(f"• {time_str} — {text_preview}…" if text_preview else f"• {time_str}")
+            current_time += timedelta(minutes=interval_min)
+
+        except Exception as e:
+            logger.error(f"autoqueue: failed to schedule post {post['id']}: {e}")
+            scheduled_lines.append(f"• ❌ Ошибка: {post['id']}")
+
+    # Refresh board once after bulk scheduling
+    try:
+        await refresh_schedule_board(community["vk_id"])
+    except Exception:
+        pass
+
+    count = len(posts)
+    summary = f"✅ Запланировано {count} постов:\n" + "\n".join(scheduled_lines)
+    await message.reply(summary)
+    logger.info(f"autoqueue: scheduled {count} posts for community {community['vk_id']}")
+
+
 # ── Admin commands ─────────────────────────────────────────────────────────────
 
 def _is_admin(user_id: int, config: Config) -> bool:
@@ -529,6 +663,7 @@ async def cmd_help(message: Message, config: Config):
         "<b>Команды бота:</b>\n\n"
         "/status — состояние мониторинга\n"
         "/queue — очередь запланированных публикаций\n"
+        "/autoqueue ЧЧ:ММ мин — массовое планирование постов из топика\n"
         "/help — эта справка\n\n"
         "<b>Планирование поста:</b>\n"
         "Нажми кнопку под постом в топике — выбери время или введи своё.",
