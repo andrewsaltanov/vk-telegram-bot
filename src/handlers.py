@@ -23,12 +23,13 @@ from callbacks import (
     DelChannelCallback,
     ManualDoneCallback,
     ManualInfoCallback,
+    RescheduleCallback,
     ScheduleCallback,
     SchedInfoCallback,
 )
 from config import Config
 from database import Database
-from keyboards import get_scheduled_badge, get_manually_placed_badge
+from keyboards import get_schedule_keyboard, get_scheduled_badge, get_manually_placed_badge
 from schedule_board import refresh_schedule_board
 from scheduler import execute_scheduled_post
 
@@ -387,6 +388,42 @@ async def handle_cancel_sched(
             await refresh_schedule_board(post["community_id"])
         except Exception as board_err:
             logger.warning(f"Could not refresh schedule board after cancel: {board_err}")
+
+
+# ── Reschedule ───────────────────────────────────────────────────────────────
+
+@router.callback_query(RescheduleCallback.filter())
+async def handle_reschedule(
+    callback: CallbackQuery,
+    callback_data: RescheduleCallback,
+    db: Database,
+    bot: Bot,
+    config: Config,
+):
+    if not _is_admin(callback.from_user.id, config):
+        await callback.answer("⛔️ Нет доступа", show_alert=True)
+        return
+
+    post = await db.get_post_by_id(callback_data.post_db_id)
+    if not post:
+        await callback.answer("❌ Пост не найден", show_alert=True)
+        return
+
+    tg_msg_id = post.get("tg_message_id")
+    if not tg_msg_id:
+        await callback.answer("❌ Сообщение поста не найдено", show_alert=True)
+        return
+
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=config.GROUP_ID,
+            message_id=tg_msg_id,
+            reply_markup=get_schedule_keyboard(callback_data.post_db_id),
+        )
+        await callback.answer("Выберите новое время")
+    except Exception as e:
+        logger.warning(f"Could not show reschedule picker: {e}")
+        await callback.answer("❌ Не удалось открыть пикер времени", show_alert=True)
 
 
 # ── Delete from channel ───────────────────────────────────────────────────────

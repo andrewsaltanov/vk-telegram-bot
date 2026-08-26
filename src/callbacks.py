@@ -30,3 +30,8 @@ class CancelSchedCallback(CallbackData, prefix="cancel_sched"):
 
 class DelChannelCallback(CallbackData, prefix="del_channel"):
     record_id: int
+
+
+class RescheduleCallback(CallbackData, prefix="reschedule"):
+    post_db_id: int
+    record_id: int

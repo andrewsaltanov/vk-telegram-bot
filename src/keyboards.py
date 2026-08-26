@@ -9,6 +9,7 @@ from callbacks import (
     DelChannelCallback,
     ManualDoneCallback,
     ManualInfoCallback,
+    RescheduleCallback,
     ScheduleCallback,
     SchedInfoCallback,
 )
@@ -115,6 +116,12 @@ def get_scheduled_badge(
         builder.button(
             text="❌ Отменить публикацию",
             callback_data=CancelSchedCallback(record_id=record_id).pack(),
+        )
+        builder.button(
+            text="📅 Перенести",
+            callback_data=RescheduleCallback(
+                post_db_id=post_db_id, record_id=record_id
+            ).pack(),
         )
         builder.adjust(1)
     return builder.as_markup()
