@@ -10,21 +10,60 @@ class Database:
         self.db_path = db_path
         self._conn: Optional[aiosqlite.Connection] = None
 
+    # ── Schema migrations ─────────────────────────────────────────────────────
+    # Add new SQL strings here (append only — never edit existing entries).
+    _MIGRATIONS: list = [
+        # v1 — add channel_message_id to scheduled_channel_posts
+        "ALTER TABLE scheduled_channel_posts ADD COLUMN channel_message_id INTEGER",
+        # v2 — add schedule_board_msg_id to communities (for per-topic queue board)
+        "ALTER TABLE communities ADD COLUMN schedule_board_msg_id INTEGER",
+    ]
+
     async def connect(self):
         self._conn = await aiosqlite.connect(self.db_path)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._create_tables()
-        # Migration: add channel_message_id column if it doesn't exist yet
-        try:
+        await self._run_migrations()
+        logger.info(f"Database connected: {self.db_path}")
+
+    async def _run_migrations(self):
+        """Apply any pending schema migrations, tracked by _schema_version table."""
+        await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS _schema_version (
+                id      INTEGER PRIMARY KEY CHECK(id = 1),
+                version INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        await self._conn.execute(
+            "INSERT OR IGNORE INTO _schema_version (id, version) VALUES (1, 0)"
+        )
+        await self._conn.commit()
+
+        async with self._conn.execute(
+            "SELECT version FROM _schema_version WHERE id = 1"
+        ) as cur:
+            row = await cur.fetchone()
+        current = row["version"] if row else 0
+
+        for idx, sql in enumerate(self._MIGRATIONS, start=1):
+            if idx <= current:
+                continue
+            logger.info(f"Applying DB migration {idx}/{len(self._MIGRATIONS)} …")
+            try:
+                await self._conn.execute(sql)
+            except aiosqlite.OperationalError as e:
+                # Column/index already exists from a manual migration — safe to skip
+                logger.warning(f"Migration {idx} skipped (already applied): {e}")
             await self._conn.execute(
-                "ALTER TABLE scheduled_channel_posts ADD COLUMN channel_message_id INTEGER"
+                "UPDATE _schema_version SET version = ? WHERE id = 1", (idx,)
             )
             await self._conn.commit()
-        except aiosqlite.OperationalError:
-            pass  # Column already exists — expected on every run after first migration
-        logger.info(f"Database connected: {self.db_path}")
+            logger.info(f"Migration {idx} applied.")
+
+        if current < len(self._MIGRATIONS):
+            logger.info(f"DB schema updated to version {len(self._MIGRATIONS)}.")
 
     async def close(self):
         if self._conn:
@@ -267,3 +306,55 @@ class Database:
         ) as cur:
             row = await cur.fetchone()
             return dict(row) if row else None
+
+    # ── Schedule board ─────────────────────────────────────────────────────────
+
+    async def get_pending_for_channel(self, channel_id: int) -> List[dict]:
+        """All pending scheduled posts for a channel, sorted by time (for board rendering)."""
+        async with self._conn.execute(
+            """
+            SELECT scp.id, scp.schedule_time, scp.content_json
+            FROM scheduled_channel_posts scp
+            WHERE scp.channel_id = ? AND scp.status = 'pending'
+            ORDER BY scp.schedule_time ASC
+            """,
+            (channel_id,),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def set_schedule_board_msg_id(self, vk_id: int, msg_id: Optional[int]):
+        await self._conn.execute(
+            "UPDATE communities SET schedule_board_msg_id = ? WHERE vk_id = ?",
+            (msg_id, vk_id),
+        )
+        await self._conn.commit()
+
+    async def get_all_pending_with_community(self) -> List[dict]:
+        """All pending scheduled posts with community name — for /queue command."""
+        async with self._conn.execute(
+            """
+            SELECT scp.id, scp.schedule_time, scp.content_json,
+                   c.name AS community_name
+            FROM scheduled_channel_posts scp
+            JOIN posts p ON scp.post_id = p.id
+            JOIN communities c ON p.community_id = c.vk_id
+            WHERE scp.status = 'pending'
+            ORDER BY scp.schedule_time ASC
+            """
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def get_pending_for_channel_near_time(
+        self, channel_id: int, schedule_ts: int, window: int = 1800
+    ) -> List[dict]:
+        """Pending posts for a channel within `window` seconds of schedule_ts."""
+        async with self._conn.execute(
+            """
+            SELECT id, schedule_time
+            FROM scheduled_channel_posts
+            WHERE channel_id = ? AND status = 'pending'
+              AND ABS(schedule_time - ?) < ?
+            """,
+            (channel_id, schedule_ts, window),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]

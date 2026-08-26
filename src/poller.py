@@ -97,7 +97,8 @@ class VKPoller:
         is_first_run = last_known_id == 0
 
         if is_first_run:
-            posts_to_send = vk_posts[-self.config.INITIAL_POSTS_COUNT:]
+            n = self.config.INITIAL_POSTS_COUNT
+            posts_to_send = vk_posts[-n:] if n > 0 else []
         else:
             posts_to_send = [p for p in vk_posts if p["id"] > last_known_id]
 
@@ -136,10 +137,18 @@ class VKPoller:
         post_type: str,
         current_vk_ids: set,
     ):
+        if not current_vk_ids:
+            return
+        # Only check posts that fall within the ID range VK returned.
+        # Posts older than the batch's oldest ID can't appear in a 50-post fetch,
+        # so calling post_exists() for them every cycle burns API quota needlessly.
+        min_vk_id = min(current_vk_ids)
         stored_posts = await self.db.get_posts_by_community(
             community["vk_id"], post_type
         )
         for stored in stored_posts:
+            if stored["vk_post_id"] < min_vk_id:
+                continue  # Too old to appear in current batch — skip
             if stored["vk_post_id"] not in current_vk_ids:
                 exists = await vk.post_exists(community["vk_id"], stored["vk_post_id"])
                 if not exists:

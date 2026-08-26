@@ -4,6 +4,7 @@ Formatting and sending VK posts to Telegram (aiogram 3.7).
 import asyncio
 import html
 import logging
+import re
 from typing import List
 
 from aiogram import Bot
@@ -17,6 +18,11 @@ logger = logging.getLogger(__name__)
 MAX_CAPTION = 1024
 MAX_TEXT = 4096
 
+def _html_len(s: str) -> int:
+    """Rendered character count Telegram uses for its limit (strips tags, decodes entities)."""
+    return len(html.unescape(re.sub(r'<[^>]+>', '', s)))
+
+
 BRAND_LINK = "https://ugnest.com/links"
 BRAND_TEXT = "Уютное гнездышко – поиск жилья, жильцов и соседей без посредников"
 SEP = "\n\n"
@@ -25,14 +31,15 @@ SEP = "\n\n"
 # ── Retry on flood control ────────────────────────────────────────────────────
 
 async def _retry(coro_fn, max_retries: int = 3):
-    for attempt in range(max_retries):
+    for attempt in range(max_retries + 1):
         try:
             return await coro_fn()
         except TelegramRetryAfter as e:
+            if attempt == max_retries:
+                raise
             wait = e.retry_after + 1
-            logger.warning(f"Flood control: waiting {wait}s (attempt {attempt + 1})")
+            logger.warning(f"Flood control: waiting {wait}s (attempt {attempt + 1}/{max_retries})")
             await asyncio.sleep(wait)
-    return await coro_fn()
 
 
 # ── Caption builder ───────────────────────────────────────────────────────────
@@ -72,7 +79,8 @@ def build_caption(content: dict, limit: int = MAX_CAPTION, is_suggested: bool = 
         att.append(f'🎥 <a href="{html.escape(vid["url"])}">{html.escape(vid["title"])}</a>')
     att_str = "\n".join(att)
 
-    raw_text = html.escape(content.get("text", "").strip())
+    plain_text = content.get("text", "").strip()
+    raw_text = html.escape(plain_text)
     see_more = (
         f'🔍 <a href="{html.escape(post_link)}">Полный пост смотрите на стене в VK</a>'
         if post_link
@@ -82,17 +90,19 @@ def build_caption(content: dict, limit: int = MAX_CAPTION, is_suggested: bool = 
     def _join(*parts) -> str:
         return SEP.join(p for p in parts if p)
 
-    # Try full text first (no truncation)
+    # Try full text first (no truncation).
+    # Use rendered length (Telegram counts after HTML parsing, not raw bytes).
     full = _join(raw_text, att_str, footer_full)
-    if len(full) <= limit:
+    if _html_len(full) <= limit:
         return full
 
     # Text is truncated — use footer_short (no 📌, since 🔍 already has the link)
-    overhead = len(_join(see_more, att_str, footer_short))
+    overhead = _html_len(_join(see_more, att_str, footer_short))
     available = limit - overhead - len(SEP) if raw_text else 0
 
     if available > 30:
-        truncated = raw_text[:available - 1] + "…"
+        # Truncate unescaped text so slicing doesn't break HTML entities
+        truncated = html.escape(plain_text[:available - 1]) + "…"
         return _join(truncated, see_more, att_str, footer_short)
 
     # No room for text at all — just show see_more

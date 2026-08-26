@@ -23,11 +23,13 @@ logger = logging.getLogger(__name__)
 _bot = None
 _db = None
 _config = None
+_refresh_board_fn = None
 
 
-def init(bot, db, config):
-    global _bot, _db, _config
+def init(bot, db, config, refresh_board_fn=None):
+    global _bot, _db, _config, _refresh_board_fn
     _bot, _db, _config = bot, db, config
+    _refresh_board_fn = refresh_board_fn
 
 
 def create_scheduler(timezone: str) -> AsyncIOScheduler:
@@ -74,30 +76,36 @@ async def execute_scheduled_post(record_id: int):
             f"Scheduled post record_id={record_id} sent to channel {record['channel_id']}"
         )
 
+        # Refresh schedule board (remove this entry from the queue display)
+        orig_post = await _db.get_post_by_id(record["post_id"])
+        if orig_post and _refresh_board_fn:
+            try:
+                await _refresh_board_fn(orig_post["community_id"])
+            except Exception as board_err:
+                logger.warning(f"Could not refresh schedule board: {board_err}")
+
         # Send notification to GROUP topic
-        if channel_msg_id and _config:
-            orig_post = await _db.get_post_by_id(record["post_id"])
-            if orig_post:
-                channel_id = record["channel_id"]
-                # Build t.me link: -1001234567890 → https://t.me/c/1234567890/msg_id
-                ch_id_str = str(abs(channel_id))[3:] if channel_id < 0 else str(channel_id)
-                link = f"https://t.me/c/{ch_id_str}/{channel_msg_id}"
+        if channel_msg_id and _config and orig_post:
+            channel_id = record["channel_id"]
+            # Build t.me link: -1001234567890 → https://t.me/c/1234567890/msg_id
+            ch_id_str = str(abs(channel_id))[3:] if channel_id < 0 else str(channel_id)
+            link = f"https://t.me/c/{ch_id_str}/{channel_msg_id}"
 
-                tz = ZoneInfo(_config.TIMEZONE)
-                time_str = datetime.now(tz).strftime("%d.%m.%Y %H:%M")
+            tz = ZoneInfo(_config.TIMEZONE)
+            time_str = datetime.now(tz).strftime("%d.%m.%Y %H:%M")
 
-                try:
-                    await _bot.send_message(
-                        chat_id=_config.GROUP_ID,
-                        text=f'📢 Опубликовано в канале {time_str}\n<a href="{link}">Ссылка на пост</a>',
-                        parse_mode="HTML",
-                        message_thread_id=orig_post.get("tg_topic_id"),
-                        reply_to_message_id=orig_post.get("tg_message_id"),
-                        reply_markup=get_published_notification_keyboard(record_id),
-                        disable_web_page_preview=True,
-                    )
-                except Exception as notify_err:
-                    logger.warning(f"Could not send publish notification: {notify_err}")
+            try:
+                await _bot.send_message(
+                    chat_id=_config.GROUP_ID,
+                    text=f'📢 Опубликовано в канале {time_str}\n<a href="{link}">Ссылка на пост</a>',
+                    parse_mode="HTML",
+                    message_thread_id=orig_post.get("tg_topic_id"),
+                    reply_to_message_id=orig_post.get("tg_message_id"),
+                    reply_markup=get_published_notification_keyboard(record_id),
+                    disable_web_page_preview=True,
+                )
+            except Exception as notify_err:
+                logger.warning(f"Could not send publish notification: {notify_err}")
 
     except Exception as e:
         logger.error(f"Failed to send scheduled post {record_id}: {e}")

@@ -14,6 +14,23 @@ from vk_client import VKClient
 logger = logging.getLogger(__name__)
 
 
+async def _topic_exists(bot: Bot, chat_id: int, thread_id: int) -> bool:
+    """Return False if the forum topic has been deleted from Telegram."""
+    try:
+        await bot.send_chat_action(
+            chat_id=chat_id,
+            action="typing",
+            message_thread_id=thread_id,
+        )
+        return True
+    except TelegramBadRequest as e:
+        if "thread" in str(e).lower():
+            return False
+        return True  # Unknown error — assume exists to avoid false recreation
+    except Exception:
+        return True
+
+
 async def setup_communities(bot: Bot, db: Database, config: Config):
     """Ensure every configured VK community has topics in the Telegram group."""
     if not config.COMMUNITIES:
@@ -27,8 +44,25 @@ async def setup_communities(bot: Bot, db: Database, config: Config):
         pub_topic_id = existing.get("published_topic_id") if existing else None
         sug_topic_id = existing.get("suggested_topic_id") if existing else None
 
+        # Verify each topic still exists in Telegram (could have been manually deleted)
+        if pub_topic_id and not await _topic_exists(bot, config.GROUP_ID, pub_topic_id):
+            logger.warning(
+                f"Published topic {pub_topic_id} for community {community_id} "
+                "not found in Telegram — will recreate."
+            )
+            await db.clear_community_topic(community_id, "published")
+            pub_topic_id = None
+
+        if sug_topic_id and not await _topic_exists(bot, config.GROUP_ID, sug_topic_id):
+            logger.warning(
+                f"Suggested topic {sug_topic_id} for community {community_id} "
+                "not found in Telegram — will recreate."
+            )
+            await db.clear_community_topic(community_id, "suggested")
+            sug_topic_id = None
+
         if pub_topic_id and sug_topic_id:
-            # Update channel_id in case it changed in communities.json
+            # Both topics confirmed — just sync channel_id if it changed
             if existing.get("channel_id") != comm_cfg.channel_id:
                 await db.upsert_community(
                     vk_id=community_id,

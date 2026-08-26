@@ -9,6 +9,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 
+import schedule_board
 from config import load_config
 from database import Database
 from handlers import router
@@ -26,7 +27,9 @@ logger = logging.getLogger(__name__)
 async def main():
     config = load_config()
 
-    os.makedirs(os.path.dirname(config.DB_PATH), exist_ok=True)
+    db_dir = os.path.dirname(config.DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
 
     # Database
     db = Database(config.DB_PATH)
@@ -42,7 +45,8 @@ async def main():
 
     # APScheduler — persistent via DB, in-memory at runtime
     scheduler = create_scheduler(config.TIMEZONE)
-    init_scheduler(bot, db, config)
+    schedule_board.init(bot, db, config)
+    init_scheduler(bot, db, config, refresh_board_fn=schedule_board.refresh_schedule_board)
     now = datetime.now(ZoneInfo(config.TIMEZONE))
     await reload_pending_jobs(scheduler, db, now)
     scheduler.start()

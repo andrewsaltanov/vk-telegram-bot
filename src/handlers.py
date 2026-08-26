@@ -12,9 +12,11 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
 from apscheduler.jobstores.base import JobLookupError
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from callbacks import (
     CancelSchedCallback,
@@ -27,6 +29,7 @@ from callbacks import (
 from config import Config
 from database import Database
 from keyboards import get_scheduled_badge, get_manually_placed_badge
+from schedule_board import refresh_schedule_board
 from scheduler import execute_scheduled_post
 
 logger = logging.getLogger(__name__)
@@ -49,6 +52,10 @@ async def handle_schedule_callback(
     config: Config,
     scheduler: AsyncIOScheduler,
 ):
+    if not _is_admin(callback.from_user.id, config):
+        await callback.answer("⛔️ Нет доступа", show_alert=True)
+        return
+
     post_db_id = callback_data.post_db_id
     option = callback_data.option
 
@@ -170,6 +177,26 @@ async def _do_schedule(
 
     # Cancel any existing pending schedule for this post (prevents double-publish)
     existing_pending = await db.get_pending_scheduled_for_post(post_db_id)
+
+    # Warn if another post for the same channel is already scheduled within ±30 min
+    nearby = await db.get_pending_for_channel_near_time(channel_id, int(schedule_time.timestamp()))
+    existing_ids = {ep["id"] for ep in existing_pending}
+    conflicts = [c for c in nearby if c["id"] not in existing_ids]
+    if conflicts:
+        tz = ZoneInfo(config.TIMEZONE)
+        times = ", ".join(
+            datetime.fromtimestamp(c["schedule_time"], tz).strftime("%H:%M")
+            for c in conflicts
+        )
+        try:
+            await bot.send_message(
+                chat_id=config.GROUP_ID,
+                text=f"⚠️ Рядом уже запланировано в этом канале: {times} (±30 мин)",
+                message_thread_id=post.get("tg_topic_id"),
+            )
+        except Exception as conflict_err:
+            logger.warning(f"Could not send conflict warning: {conflict_err}")
+
     for ep in existing_pending:
         job_id = ep.get("job_id")
         if job_id:
@@ -232,6 +259,13 @@ async def _do_schedule(
         except Exception as reply_err:
             logger.warning(f"Could not send schedule marker for post {post_db_id}: {reply_err}")
 
+        # 6. Update the schedule board in the topic
+        if community:
+            try:
+                await refresh_schedule_board(community["vk_id"])
+            except Exception as board_err:
+                logger.warning(f"Could not refresh schedule board: {board_err}")
+
     except Exception as e:
         logger.error(f"Schedule error: {e}")
         await _notify(event, f"❌ Ошибка планирования: {e}", alert=True)
@@ -247,6 +281,10 @@ async def handle_manual_done(
     bot: Bot,
     config: Config,
 ):
+    if not _is_admin(callback.from_user.id, config):
+        await callback.answer("⛔️ Нет доступа", show_alert=True)
+        return
+
     post = await db.get_post_by_id(callback_data.post_db_id)
     if not post:
         await callback.answer("❌ Пост не найден", show_alert=True)
@@ -321,8 +359,13 @@ async def handle_cancel_sched(
     callback: CallbackQuery,
     callback_data: CancelSchedCallback,
     db: Database,
+    config: Config,
     scheduler: AsyncIOScheduler,
 ):
+    if not _is_admin(callback.from_user.id, config):
+        await callback.answer("⛔️ Нет доступа", show_alert=True)
+        return
+
     record = await db.get_scheduled_post_record(callback_data.record_id)
     if not record or record["status"] != "pending":
         await callback.answer("Публикация уже не активна", show_alert=True)
@@ -337,6 +380,14 @@ async def handle_cancel_sched(
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.answer("❌ Публикация отменена", show_alert=True)
 
+    # Refresh board so cancelled post disappears from the queue display
+    post = await db.get_post_by_id(record["post_id"])
+    if post:
+        try:
+            await refresh_schedule_board(post["community_id"])
+        except Exception as board_err:
+            logger.warning(f"Could not refresh schedule board after cancel: {board_err}")
+
 
 # ── Delete from channel ───────────────────────────────────────────────────────
 
@@ -346,7 +397,12 @@ async def handle_del_channel(
     callback_data: DelChannelCallback,
     db: Database,
     bot: Bot,
+    config: Config,
 ):
+    if not _is_admin(callback.from_user.id, config):
+        await callback.answer("⛔️ Нет доступа", show_alert=True)
+        return
+
     record = await db.get_scheduled_post_record(callback_data.record_id)
     if not record:
         await callback.answer("Запись не найдена", show_alert=True)
@@ -367,6 +423,7 @@ async def handle_del_channel(
 # ── Admin commands ─────────────────────────────────────────────────────────────
 
 def _is_admin(user_id: int, config: Config) -> bool:
+    # Empty ADMIN_IDS = unrestricted (open bot). Set ADMIN_IDS in .env to restrict.
     return not config.ADMIN_IDS or user_id in config.ADMIN_IDS
 
 
@@ -390,6 +447,43 @@ async def cmd_status(message: Message, db: Database, config: Config):
     await message.reply("\n".join(lines), parse_mode="HTML")
 
 
+@router.message(Command("queue"))
+async def cmd_queue(message: Message, db: Database, config: Config):
+    if not _is_admin(message.from_user.id, config):
+        return
+    records = await db.get_all_pending_with_community()
+    if not records:
+        await message.reply("📅 Запланированных публикаций нет.")
+        return
+
+    tz = ZoneInfo(config.TIMEZONE)
+    builder = InlineKeyboardBuilder()
+    lines = ["📅 <b>Запланированные публикации:</b>\n"]
+    for r in records:
+        t = datetime.fromtimestamp(r["schedule_time"], tz).strftime("%d.%m %H:%M")
+        try:
+            text = json.loads(r["content_json"]).get("text", "").strip()
+        except (json.JSONDecodeError, TypeError):
+            text = ""
+        preview = text[:50] + ("…" if len(text) > 50 else "")
+        community = r["community_name"]
+        lines.append(f"• <b>{community}</b> — {t}")
+        if preview:
+            lines.append(f"  {preview}")
+        builder.row(
+            InlineKeyboardButton(
+                text=f"❌ Отменить {t}",
+                callback_data=CancelSchedCallback(record_id=r["id"]).pack(),
+            )
+        )
+
+    await message.reply(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=builder.as_markup(),
+    )
+
+
 @router.message(Command("help"))
 async def cmd_help(message: Message, config: Config):
     if not _is_admin(message.from_user.id, config):
@@ -397,6 +491,7 @@ async def cmd_help(message: Message, config: Config):
     await message.reply(
         "<b>Команды бота:</b>\n\n"
         "/status — состояние мониторинга\n"
+        "/queue — очередь запланированных публикаций\n"
         "/help — эта справка\n\n"
         "<b>Планирование поста:</b>\n"
         "Нажми кнопку под постом в топике — выбери время или введи своё.",
