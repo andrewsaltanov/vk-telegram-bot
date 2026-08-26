@@ -16,6 +16,7 @@ from apscheduler.jobstores.memory import MemoryJobStore
 
 from keyboards import get_published_notification_keyboard
 from post_sender import send_post_to_channel
+from vk_client import VKClient
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,62 @@ def create_scheduler(timezone: str) -> AsyncIOScheduler:
     )
 
 
+# ── VK content pre-flight check ───────────────────────────────────────────────
+
+async def _check_vk_content(
+    record_id: int,
+    post_id: int,
+    community_id: int,
+    vk_post_id: int,
+    saved_content: dict,
+) -> tuple:
+    """
+    Fetches current VK content and compares with saved.
+    Returns: (content_to_use, content_was_updated, post_was_deleted)
+    Fail-open: on any error, returns saved_content unchanged.
+    """
+    if _config is None:
+        return saved_content, False, False
+
+    comm_cfg = _config.get_community_config(community_id)
+    if not comm_cfg:
+        return saved_content, False, False
+
+    try:
+        async with VKClient(comm_cfg.token, user_token=comm_cfg.user_token) as vk:
+            post_data = await vk.fetch_post_data(community_id, vk_post_id)
+
+        if post_data is None:
+            # API error — fail-open, use saved content
+            logger.warning(
+                f"VK API error fetching post {vk_post_id} for record {record_id} — using saved content"
+            )
+            return saved_content, False, False
+
+        if post_data == {}:
+            # Post was deleted from VK
+            return saved_content, False, True
+
+        # Post exists — extract fresh content and compare text
+        fresh_content = VKClient("").extract_post_content(post_data)
+        # Preserve metadata fields added at send time
+        for key in ("post_link", "author_link", "community_name"):
+            fresh_content[key] = saved_content.get(key, "")
+
+        if fresh_content.get("text", "") != saved_content.get("text", ""):
+            fresh_json = json.dumps(fresh_content, ensure_ascii=False)
+            await _db.update_post_content_json(post_id, fresh_json)
+            await _db.update_scheduled_post_content_json(record_id, fresh_json)
+            logger.info(f"VK post {vk_post_id} text changed — updated record {record_id}")
+            return fresh_content, True, False
+
+        return saved_content, False, False
+
+    except Exception as e:
+        logger.warning(f"Error checking VK content for record {record_id}: {e}")
+        return saved_content, False, False
+
+
 # ── Job function ──────────────────────────────────────────────────────────────
 
 async def execute_scheduled_post(record_id: int):
@@ -59,6 +116,38 @@ async def execute_scheduled_post(record_id: int):
         await _db.mark_scheduled_post_sent(record_id)  # Prevent infinite retry
         return
 
+    # Fetch original post BEFORE try block — needed for VK check and board refresh
+    orig_post = await _db.get_post_by_id(record["post_id"])
+
+    # Check VK for content changes / deletion before publishing
+    content_was_updated = False
+    if orig_post:
+        content, content_was_updated, post_deleted = await _check_vk_content(
+            record_id=record_id,
+            post_id=record["post_id"],
+            community_id=orig_post["community_id"],
+            vk_post_id=orig_post["vk_post_id"],
+            saved_content=content,
+        )
+        if post_deleted:
+            await _db.mark_scheduled_post_cancelled(record_id)
+            logger.info(f"Record {record_id}: VK post deleted — cancelling publication")
+            try:
+                await _bot.send_message(
+                    chat_id=_config.GROUP_ID,
+                    text="🚫 Публикация отменена — пост удалён на VK",
+                    message_thread_id=orig_post.get("tg_topic_id"),
+                    reply_to_message_id=orig_post.get("tg_message_id"),
+                )
+            except Exception as e:
+                logger.warning(f"Could not send deletion notice: {e}")
+            if _refresh_board_fn:
+                try:
+                    await _refresh_board_fn(orig_post["community_id"])
+                except Exception:
+                    pass
+            return
+
     try:
         msg_ids = await send_post_to_channel(
             bot=_bot,
@@ -77,7 +166,6 @@ async def execute_scheduled_post(record_id: int):
         )
 
         # Refresh schedule board (remove this entry from the queue display)
-        orig_post = await _db.get_post_by_id(record["post_id"])
         if orig_post and _refresh_board_fn:
             try:
                 await _refresh_board_fn(orig_post["community_id"])
@@ -85,7 +173,10 @@ async def execute_scheduled_post(record_id: int):
                 logger.warning(f"Could not refresh schedule board: {board_err}")
 
         # Send notification to GROUP topic
-        if channel_msg_id and _config and orig_post:
+        community = await _db.get_community(orig_post["community_id"]) if orig_post else None
+        muted = community.get("notifications_muted", 0) if community else 0
+
+        if channel_msg_id and _config and orig_post and not muted:
             channel_id = record["channel_id"]
             # Build t.me link: -1001234567890 → https://t.me/c/1234567890/msg_id
             ch_id_str = str(abs(channel_id))[3:] if channel_id < 0 else str(channel_id)
@@ -93,11 +184,12 @@ async def execute_scheduled_post(record_id: int):
 
             tz = ZoneInfo(_config.TIMEZONE)
             time_str = datetime.now(tz).strftime("%d.%m.%Y %H:%M")
+            update_line = "\n📝 Текст обновился на VK — опубликована актуальная версия" if content_was_updated else ""
 
             try:
                 await _bot.send_message(
                     chat_id=_config.GROUP_ID,
-                    text=f'📢 Опубликовано в канале {time_str}\n<a href="{link}">Ссылка на пост</a>',
+                    text=f'📢 Опубликовано в канале {time_str}{update_line}\n<a href="{link}">Ссылка на пост</a>',
                     parse_mode="HTML",
                     message_thread_id=orig_post.get("tg_topic_id"),
                     reply_to_message_id=orig_post.get("tg_message_id"),
