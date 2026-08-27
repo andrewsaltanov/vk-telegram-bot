@@ -12,6 +12,8 @@ from datetime import datetime
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
 
+from tg_utils import safe_call
+
 logger = logging.getLogger(__name__)
 
 _bot: Bot | None = None
@@ -38,6 +40,7 @@ async def refresh_schedule_board(community_vk_id: int) -> None:
 
     board_msg_id = community.get("schedule_board_msg_id")
     if board_msg_id:
+        needs_recreate = False
         try:
             await _bot.edit_message_text(
                 chat_id=_config.GROUP_ID,
@@ -45,16 +48,23 @@ async def refresh_schedule_board(community_vk_id: int) -> None:
                 text=board_text,
                 parse_mode="HTML",
             )
-            return
         except TelegramBadRequest as e:
-            if "message to edit not found" in str(e).lower() or "message_id_invalid" in str(e).lower():
+            err = str(e).lower()
+            if "message to edit not found" in err or "message_id_invalid" in err:
                 logger.info(f"Board message {board_msg_id} was deleted — will recreate.")
                 await _db.set_schedule_board_msg_id(community_vk_id, None)
+                needs_recreate = True
+            elif "message is not modified" in err:
+                pass  # content already up to date — still (re-)pin below
             else:
                 logger.warning(f"Could not edit schedule board for community {community_vk_id}: {e}")
                 return
         except Exception as e:
             logger.warning(f"Could not edit schedule board for community {community_vk_id}: {e}")
+            return
+
+        if not needs_recreate:
+            await _pin_board_message(board_msg_id)
             return
 
     try:
@@ -66,8 +76,23 @@ async def refresh_schedule_board(community_vk_id: int) -> None:
             disable_notification=True,
         )
         await _db.set_schedule_board_msg_id(community_vk_id, msg.message_id)
+        await _pin_board_message(msg.message_id)
     except Exception as e:
         logger.warning(f"Could not send schedule board for community {community_vk_id}: {e}")
+
+
+async def _pin_board_message(message_id: int) -> None:
+    """Pin the board message in its topic — re-pinning an already-pinned message is a no-op,
+    so this is safe to call on every refresh (covers admins accidentally unpinning it)."""
+    await safe_call(
+        _bot.pin_chat_message(
+            chat_id=_config.GROUP_ID,
+            message_id=message_id,
+            disable_notification=True,
+        ),
+        logger,
+        f"Could not pin schedule board message {message_id}",
+    )
 
 
 def _build_board_text(pending: list) -> str:
