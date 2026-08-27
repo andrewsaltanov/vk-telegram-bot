@@ -22,6 +22,8 @@ class Database:
         "ALTER TABLE communities ADD COLUMN schedule_board_msg_id INTEGER",
         # v3 — add notifications_muted to communities (for mute feature)
         "ALTER TABLE communities ADD COLUMN notifications_muted INTEGER DEFAULT 0",
+        # v4 — add suggested_board_msg_id to communities (queue board mirrored into the suggested topic)
+        "ALTER TABLE communities ADD COLUMN suggested_board_msg_id INTEGER",
     ]
 
     async def connect(self):
@@ -330,6 +332,13 @@ class Database:
     async def set_schedule_board_msg_id(self, vk_id: int, msg_id: Optional[int]):
         await self._conn.execute(
             "UPDATE communities SET schedule_board_msg_id = ? WHERE vk_id = ?",
+            (msg_id, vk_id),
+        )
+        await self._conn.commit()
+
+    async def set_suggested_board_msg_id(self, vk_id: int, msg_id: Optional[int]):
+        await self._conn.execute(
+            "UPDATE communities SET suggested_board_msg_id = ? WHERE vk_id = ?",
             (msg_id, vk_id),
         )
         await self._conn.commit()
