@@ -5,11 +5,12 @@ import asyncio
 import html
 import logging
 import re
-from typing import List
+from typing import List, Optional
 
+import aiohttp
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
-from aiogram.types import InputMediaPhoto
+from aiogram.types import BufferedInputFile, InputMediaPhoto
 
 from keyboards import get_manual_post_keyboard
 
@@ -28,7 +29,14 @@ BRAND_TEXT = "Уютное гнездышко – поиск жилья, жил�
 SEP = "\n\n"
 
 
-# ── Retry on flood control ────────────────────────────────────────────────────
+# ── Retry on flood control / transient media-fetch failures ─────────────────
+
+# Telegram fetches media URLs itself; a burst of several photo fetches in one
+# sendMediaGroup call can trip VK CDN's own rate-limiting even though every
+# URL is independently reachable — a short backoff before retrying the exact
+# same request often succeeds once that burst has passed.
+WEBPAGE_FETCH_RETRY_DELAYS = (5, 10, 20)
+
 
 async def _retry(coro_fn, max_retries: int = 3):
     for attempt in range(max_retries + 1):
@@ -40,6 +48,45 @@ async def _retry(coro_fn, max_retries: int = 3):
             wait = e.retry_after + 1
             logger.warning(f"Flood control: waiting {wait}s (attempt {attempt + 1}/{max_retries})")
             await asyncio.sleep(wait)
+        except TelegramBadRequest as e:
+            if "webpage_curl_failed" not in str(e).lower() or attempt >= len(WEBPAGE_FETCH_RETRY_DELAYS):
+                raise
+            wait = WEBPAGE_FETCH_RETRY_DELAYS[attempt]
+            logger.warning(
+                f"WEBPAGE_CURL_FAILED, retrying in {wait}s (attempt {attempt + 1}/{len(WEBPAGE_FETCH_RETRY_DELAYS)})"
+            )
+            await asyncio.sleep(wait)
+
+
+# ── Photo download (upload bytes ourselves instead of letting Telegram fetch) ─
+
+PHOTO_DOWNLOAD_TIMEOUT = 20
+
+
+async def _download_photos(urls: List[str]) -> List[BufferedInputFile]:
+    """
+    Download each photo ourselves and hand Telegram the bytes, instead of
+    passing the URL for Telegram's server to fetch. VK's CDN intermittently
+    refuses Telegram's own fetcher for a given edge node (WEBPAGE_CURL_FAILED)
+    even though the same URL is reliably reachable from here — downloading
+    ourselves sidesteps that entirely. Photos that fail to download are
+    skipped rather than failing the whole post.
+    """
+    async def fetch(session: aiohttp.ClientSession, index: int, url: str) -> Optional[BufferedInputFile]:
+        try:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    logger.warning(f"Photo download got HTTP {resp.status}: {url}")
+                    return None
+                data = await resp.read()
+                return BufferedInputFile(data, filename=f"photo{index}.jpg")
+        except Exception as e:
+            logger.warning(f"Could not download photo, skipping: {url} ({e})")
+            return None
+
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=PHOTO_DOWNLOAD_TIMEOUT)) as session:
+        files = await asyncio.gather(*(fetch(session, i, url) for i, url in enumerate(urls)))
+    return [f for f in files if f is not None]
 
 
 # ── Caption builder ───────────────────────────────────────────────────────────
@@ -142,14 +189,22 @@ async def send_vk_post_to_topic(
 
             album_anchor_id: int | None = None
             if media_urls:
-                media = [InputMediaPhoto(media=url) for url in media_urls]
-                msgs = await _retry(lambda: bot.send_media_group(
-                    chat_id=chat_id,
-                    media=media,
-                    message_thread_id=thread_id,
-                ))
-                message_ids.extend(m.message_id for m in msgs)
-                album_anchor_id = msgs[0].message_id
+                files = await _download_photos(media_urls)
+                if files:
+                    try:
+                        media = [InputMediaPhoto(media=f) for f in files]
+                        msgs = await _retry(lambda: bot.send_media_group(
+                            chat_id=chat_id,
+                            media=media,
+                            message_thread_id=thread_id,
+                        ))
+                        message_ids.extend(m.message_id for m in msgs)
+                        album_anchor_id = msgs[0].message_id
+                    except Exception as album_err:
+                        # Don't lose the post over a failed album — still send the text below.
+                        logger.warning(f"Could not send album for topic {thread_id}, skipping photos: {album_err}")
+                else:
+                    logger.warning(f"Could not download any photos for topic {thread_id}, skipping photos")
 
             # 2. Full text as separate message (up to 4096 chars, not truncated in caption)
             text_caption = build_caption(content, limit=MAX_TEXT, is_suggested=is_suggested)
@@ -186,33 +241,74 @@ async def send_vk_post_to_topic(
         elif photos:
             # ── Normal photo post ──
             caption = build_caption(content, limit=MAX_CAPTION, is_suggested=is_suggested)
-            if len(photos) == 1:
-                msg = await _retry(lambda: bot.send_photo(
+            photos_sent = False
+            files = await _download_photos(photos[:10])
+            if files:
+                try:
+                    if len(files) == 1:
+                        msg = await _retry(lambda: bot.send_photo(
+                            chat_id=chat_id,
+                            photo=files[0],
+                            caption=caption,
+                            parse_mode="HTML",
+                            message_thread_id=thread_id,
+                            reply_markup=keyboard,
+                        ))
+                        message_ids.append(msg.message_id)
+                    else:
+                        media = [InputMediaPhoto(media=f) for f in files]
+                        media[0].caption = caption
+                        media[0].parse_mode = "HTML"
+                        msgs = await _retry(lambda: bot.send_media_group(
+                            chat_id=chat_id,
+                            media=media,
+                            message_thread_id=thread_id,
+                        ))
+                        message_ids.extend(m.message_id for m in msgs)
+                        if keyboard:
+                            btn_msg = await _retry(lambda: bot.send_message(
+                                chat_id=chat_id,
+                                text="📋 Действия с постом:",
+                                message_thread_id=thread_id,
+                                reply_markup=keyboard,
+                                reply_to_message_id=msgs[0].message_id,
+                            ))
+                            message_ids.insert(0, btn_msg.message_id)
+                    photos_sent = True
+                except Exception as photo_err:
+                    # Fall back to text-only so the post (and a link back to VK for the
+                    # photos) isn't lost entirely.
+                    logger.warning(
+                        f"Could not send photo(s) for topic {thread_id}, falling back to text-only: {photo_err}"
+                    )
+                    message_ids.clear()
+            else:
+                logger.warning(f"Could not download any photos for topic {thread_id}, falling back to text-only")
+
+            if not photos_sent:
+                text_caption = build_caption(content, limit=MAX_TEXT, is_suggested=is_suggested)
+                text_msg = await _retry(lambda: bot.send_message(
                     chat_id=chat_id,
-                    photo=photos[0],
-                    caption=caption,
+                    text=text_caption,
                     parse_mode="HTML",
                     message_thread_id=thread_id,
-                    reply_markup=keyboard,
+                    disable_web_page_preview=True,
                 ))
-                message_ids.append(msg.message_id)
-            else:
-                media = [InputMediaPhoto(media=url) for url in photos[:10]]
-                media[0].caption = caption
-                media[0].parse_mode = "HTML"
-                msgs = await _retry(lambda: bot.send_media_group(
-                    chat_id=chat_id,
-                    media=media,
-                    message_thread_id=thread_id,
-                ))
-                message_ids.extend(m.message_id for m in msgs)
-                if keyboard:
+                message_ids.append(text_msg.message_id)
+
+                manual_keyboard = get_manual_post_keyboard(post_db_id) if post_db_id else keyboard
+                if manual_keyboard:
                     btn_msg = await _retry(lambda: bot.send_message(
                         chat_id=chat_id,
-                        text="📋 Действия с постом:",
+                        text=(
+                            "⚠️ <b>Не удалось загрузить фото поста.</b>\n"
+                            "Проверьте оригинал в VK и разместите вручную при необходимости.\n\n"
+                            "📋 Действия с постом:"
+                        ),
+                        parse_mode="HTML",
                         message_thread_id=thread_id,
-                        reply_markup=keyboard,
-                        reply_to_message_id=msgs[0].message_id,
+                        reply_markup=manual_keyboard,
+                        reply_to_message_id=text_msg.message_id,
                     ))
                     message_ids.insert(0, btn_msg.message_id)
         else:
@@ -251,29 +347,45 @@ async def send_post_to_channel(
     message_ids: List[int] = []
 
     try:
+        photos_sent = False
         if photos:
-            if len(photos) == 1:
-                msg = await _retry(lambda: bot.send_photo(
-                    chat_id=channel_id,
-                    photo=photos[0],
-                    caption=caption,
-                    parse_mode="HTML",
-                ))
-                message_ids.append(msg.message_id)
+            files = await _download_photos(photos[:10])
+            if files:
+                try:
+                    if len(files) == 1:
+                        msg = await _retry(lambda: bot.send_photo(
+                            chat_id=channel_id,
+                            photo=files[0],
+                            caption=caption,
+                            parse_mode="HTML",
+                        ))
+                        message_ids.append(msg.message_id)
+                    else:
+                        # Album — caption on first photo
+                        media = [InputMediaPhoto(media=f) for f in files]
+                        media[0].caption = caption
+                        media[0].parse_mode = "HTML"
+                        msgs = await _retry(lambda: bot.send_media_group(
+                            chat_id=channel_id,
+                            media=media,
+                        ))
+                        message_ids.extend(m.message_id for m in msgs)
+                    photos_sent = True
+                except Exception as photo_err:
+                    # Fall back to text-only rather than silently losing a paid
+                    # channel publication.
+                    logger.warning(
+                        f"Could not send photo(s) to channel {channel_id}, falling back to text-only: {photo_err}"
+                    )
+                    message_ids.clear()
             else:
-                # Album — caption on first photo
-                media = [InputMediaPhoto(media=url) for url in photos[:10]]
-                media[0].caption = caption
-                media[0].parse_mode = "HTML"
-                msgs = await _retry(lambda: bot.send_media_group(
-                    chat_id=channel_id,
-                    media=media,
-                ))
-                message_ids.extend(m.message_id for m in msgs)
-        else:
+                logger.warning(f"Could not download any photos for channel {channel_id}, falling back to text-only")
+
+        if not photos or not photos_sent:
+            text_caption = build_caption(content, limit=MAX_TEXT, is_suggested=is_suggested)
             msg = await _retry(lambda: bot.send_message(
                 chat_id=channel_id,
-                text=caption,
+                text=text_caption,
                 parse_mode="HTML",
                 disable_web_page_preview=True,
             ))

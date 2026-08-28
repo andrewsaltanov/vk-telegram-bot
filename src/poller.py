@@ -223,11 +223,18 @@ class VKPoller:
 
         if msg_ids:
             await self.db.update_post_message_id(post_db_id, msg_ids[0])
-
-        logger.info(
-            f"Sent {post_type} post vk_id={post['id']} "
-            f"community={community_id} → topic={topic_id}"
-        )
+            logger.info(
+                f"Sent {post_type} post vk_id={post['id']} "
+                f"community={community_id} → topic={topic_id}"
+            )
+        else:
+            # post_sender.py already falls back to a text-only send on photo failures,
+            # so this means everything failed (e.g. Telegram outage) — the DB row now
+            # exists (post_db_id), so this vk_post_id won't be retried; log loudly.
+            logger.error(
+                f"Failed to send {post_type} post vk_id={post['id']} "
+                f"community={community_id} → topic={topic_id} — no message was created"
+            )
 
     # ── Handle deletion ───────────────────────────────────────────────────────
 
