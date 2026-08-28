@@ -152,6 +152,15 @@ class VKPoller:
     ):
         if not current_vk_ids:
             return
+        if post_type == "suggested":
+            # A suggested post vanishes from wall.get(filter=suggests) both when it's
+            # withdrawn/deleted AND when it's approved onto the public wall (often
+            # under a different post id) — post_exists() can't tell those apart, so
+            # we never auto-clean-up suggested posts here. Confirmed in production:
+            # a suggested post got marked "deleted" and its message/DB row removed
+            # just 11 minutes after being posted, almost certainly because it was
+            # approved, not withdrawn. Published posts don't have this ambiguity.
+            return
         # Only check posts that fall within the ID range VK returned.
         # Posts older than the batch's oldest ID can't appear in a 50-post fetch,
         # so calling post_exists() for them every cycle burns API quota needlessly.
