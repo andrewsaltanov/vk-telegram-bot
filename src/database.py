@@ -113,6 +113,15 @@ class Database:
                 status       TEXT DEFAULT 'pending',
                 created_at   INTEGER DEFAULT (strftime('%s','now'))
             );
+
+            CREATE TABLE IF NOT EXISTS pending_comment_continuations (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id        INTEGER NOT NULL,
+                channel_msg_id    INTEGER NOT NULL,
+                continuation_text TEXT NOT NULL,
+                status            TEXT DEFAULT 'pending',
+                created_at        INTEGER DEFAULT (strftime('%s','now'))
+            );
         """)
         await self._conn.commit()
 
@@ -450,5 +459,61 @@ class Database:
         await self._conn.execute(
             "UPDATE communities SET notifications_muted = ? WHERE vk_id = ?",
             (int(muted), vk_id),
+        )
+        await self._conn.commit()
+
+    # ── Pending comment continuations ────────────────────────────────────────
+
+    async def create_pending_continuation(
+        self, channel_id: int, channel_msg_id: int, continuation_text: str
+    ) -> int:
+        async with self._conn.execute(
+            """
+            INSERT INTO pending_comment_continuations (channel_id, channel_msg_id, continuation_text)
+            VALUES (?, ?, ?)
+            """,
+            (channel_id, channel_msg_id, continuation_text),
+        ) as cur:
+            row_id = cur.lastrowid
+        await self._conn.commit()
+        return row_id
+
+    async def get_pending_continuation(
+        self, channel_id: int, channel_msg_id: int
+    ) -> Optional[dict]:
+        async with self._conn.execute(
+            """
+            SELECT * FROM pending_comment_continuations
+            WHERE channel_id = ? AND channel_msg_id = ? AND status = 'pending'
+            """,
+            (channel_id, channel_msg_id),
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def get_stale_pending_continuations(self, cutoff_ts: int) -> List[dict]:
+        """Pending continuations whose channel-post mirror never showed up in the
+        discussion group before `cutoff_ts` — the caller falls back to posting
+        them without threading."""
+        async with self._conn.execute(
+            """
+            SELECT * FROM pending_comment_continuations
+            WHERE status = 'pending' AND created_at < ?
+            """,
+            (cutoff_ts,),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def mark_continuation_sent(self, continuation_id: int):
+        await self._conn.execute(
+            "UPDATE pending_comment_continuations SET status = 'sent' WHERE id = ?",
+            (continuation_id,),
+        )
+        await self._conn.commit()
+
+    async def mark_continuation_failed(self, continuation_id: int):
+        await self._conn.execute(
+            "UPDATE pending_comment_continuations SET status = 'failed' WHERE id = ?",
+            (continuation_id,),
         )
         await self._conn.commit()

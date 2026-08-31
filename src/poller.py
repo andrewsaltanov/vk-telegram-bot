@@ -12,6 +12,7 @@ from aiogram.exceptions import TelegramBadRequest
 from apscheduler.jobstores.base import JobLookupError
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+import channel_comments
 from config import Config
 from database import Database
 from keyboards import get_schedule_keyboard
@@ -76,6 +77,11 @@ class VKPoller:
                     f"Error polling community {community['vk_id']}: {e}", exc_info=True
                 )
             await asyncio.sleep(BETWEEN_COMMUNITIES_DELAY)
+
+        try:
+            await channel_comments.flush_stale_continuations(self.bot, self.db)
+        except Exception as e:
+            logger.error(f"Error flushing stale comment continuations: {e}", exc_info=True)
 
     async def _poll_community(self, vk: VKClient, community: dict):
         if community.get("published_topic_id"):

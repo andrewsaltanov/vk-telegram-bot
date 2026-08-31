@@ -91,6 +91,24 @@ async def _download_photos(urls: List[str]) -> List[BufferedInputFile]:
 
 # ── Caption builder ───────────────────────────────────────────────────────────
 
+COMMENTS_NOTE = "💬 Продолжение описания — в комментариях"
+
+
+def _build_attachments(content: dict) -> str:
+    att = []
+    for url in content.get("links", []):
+        att.append(f"🔗 {html.escape(url)}")
+    for doc in content.get("docs", []):
+        att.append(f'📎 <a href="{html.escape(doc["url"])}">{html.escape(doc["title"])}</a>')
+    for vid in content.get("videos", []):
+        att.append(f'🎥 <a href="{html.escape(vid["url"])}">{html.escape(vid["title"])}</a>')
+    return "\n".join(att)
+
+
+def _join(*parts) -> str:
+    return SEP.join(p for p in parts if p)
+
+
 def build_caption(content: dict, limit: int = MAX_CAPTION, is_suggested: bool = False) -> str:
     """
     Build a Telegram HTML caption for a VK post.
@@ -99,6 +117,11 @@ def build_caption(content: dict, limit: int = MAX_CAPTION, is_suggested: bool = 
     If text fits:   text + attachments + footer + brand
     If truncated:   text… + 🔍 Полный пост... + attachments + brand
                     (footer link omitted — 🔍 already links to the post)
+
+    The 🔍 "see more" link for suggested posts points at the author's profile
+    rather than post_link: post_link is the post's URL in VK's suggestion
+    queue, which stops resolving as soon as the post leaves that queue
+    (approved or withdrawn) — often within minutes.
     """
     post_link = content.get("post_link", "")
     author_link = content.get("author_link", "")
@@ -116,26 +139,16 @@ def build_caption(content: dict, limit: int = MAX_CAPTION, is_suggested: bool = 
     # footer_short omits the link when 🔍 already links there (used when text is truncated)
     footer_short = brand
 
-    # --- attachments ---
-    att = []
-    for url in content.get("links", []):
-        att.append(f"🔗 {html.escape(url)}")
-    for doc in content.get("docs", []):
-        att.append(f'📎 <a href="{html.escape(doc["url"])}">{html.escape(doc["title"])}</a>')
-    for vid in content.get("videos", []):
-        att.append(f'🎥 <a href="{html.escape(vid["url"])}">{html.escape(vid["title"])}</a>')
-    att_str = "\n".join(att)
+    att_str = _build_attachments(content)
 
     plain_text = content.get("text", "").strip()
     raw_text = html.escape(plain_text)
+    see_more_link = author_link if (is_suggested and author_link) else post_link
     see_more = (
-        f'🔍 <a href="{html.escape(post_link)}">Полный пост смотрите на стене в VK</a>'
-        if post_link
+        f'🔍 <a href="{html.escape(see_more_link)}">Полный пост смотрите на стене в VK</a>'
+        if see_more_link
         else "🔍 Полный пост смотрите на стене в VK"
     )
-
-    def _join(*parts) -> str:
-        return SEP.join(p for p in parts if p)
 
     # Try full text first (no truncation).
     # Use rendered length (Telegram counts after HTML parsing, not raw bytes).
@@ -154,6 +167,79 @@ def build_caption(content: dict, limit: int = MAX_CAPTION, is_suggested: bool = 
 
     # No room for text at all — just show see_more
     return _join(see_more, att_str, footer_short)
+
+
+def build_channel_caption(
+    content: dict, limit: int, is_suggested: bool
+) -> tuple[str, Optional[str]]:
+    """
+    Caption for the public channel post. For suggested posts whose text
+    doesn't fit `limit`, truncates without a VK link at all — post_link
+    (the suggestion-queue URL) is dead by the time this is published, and
+    unlike the admin-topic preview there's no author profile worth sending
+    people to on the public channel — and returns the untruncated remainder
+    so the caller can post it as a channel comment instead. Everything else
+    behaves exactly like build_caption().
+    """
+    if not is_suggested:
+        return build_caption(content, limit=limit, is_suggested=is_suggested), None
+
+    brand = f'<a href="{html.escape(BRAND_LINK)}">{html.escape(BRAND_TEXT)}</a>'
+    author_link = content.get("author_link", "")
+    footer_full = (
+        f'👤 <a href="{html.escape(author_link)}">Ссылка на автора поста в VK</a>\n\n{brand}'
+        if author_link
+        else brand
+    )
+    att_str = _build_attachments(content)
+
+    plain_text = content.get("text", "").strip()
+    raw_text = html.escape(plain_text)
+
+    full = _join(raw_text, att_str, footer_full)
+    if _html_len(full) <= limit:
+        return full, None
+
+    overhead = _html_len(_join(COMMENTS_NOTE, att_str, brand))
+    available = limit - overhead - len(SEP) if raw_text else 0
+
+    if available > 30:
+        truncated = html.escape(plain_text[:available - 1]) + "…"
+        caption = _join(truncated, COMMENTS_NOTE, att_str, brand)
+        remainder = plain_text[available - 1:].strip()
+    else:
+        caption = _join(COMMENTS_NOTE, att_str, brand)
+        remainder = plain_text
+
+    return caption, (remainder or None)
+
+
+def build_continuation_messages(remainder_text: str, limit: int = MAX_TEXT) -> List[str]:
+    """
+    Split the untruncated remainder of a post into <=`limit`-char HTML
+    messages for posting as channel comments. The brand link is appended to
+    the last chunk (its own message if it doesn't fit alongside the text).
+    """
+    text = remainder_text.strip()
+    brand = f'<a href="{html.escape(BRAND_LINK)}">{html.escape(BRAND_TEXT)}</a>'
+    if not text:
+        return [brand]
+
+    raw_chunks: List[str] = []
+    while len(text) > limit:
+        cut = text.rfind(" ", 0, limit)
+        if cut < limit // 2:
+            cut = limit
+        raw_chunks.append(text[:cut].strip())
+        text = text[cut:].strip()
+    raw_chunks.append(text)
+
+    messages = [html.escape(c) for c in raw_chunks]
+    if _html_len(messages[-1]) + _html_len(SEP + brand) <= limit:
+        messages[-1] = _join(messages[-1], brand)
+    else:
+        messages.append(brand)
+    return messages
 
 
 # ── Send to group topic (preview + schedule buttons) ─────────────────────────
@@ -340,15 +426,22 @@ async def send_post_to_channel(
     channel_id: int,
     content: dict,
     is_suggested: bool = False,
-) -> List[int]:
+) -> tuple[List[int], Optional[str]]:
+    """
+    Returns (message_ids, continuation_text). continuation_text is set when a
+    suggested post's caption had to be truncated — the caller is expected to
+    post it as a channel comment (see channel_comments.py).
+    """
     photos = content.get("photos", [])
-    lim = MAX_CAPTION if photos else MAX_TEXT
-    caption = build_caption(content, limit=lim, is_suggested=is_suggested)
     message_ids: List[int] = []
+    continuation: Optional[str] = None
 
     try:
         photos_sent = False
         if photos:
+            caption, continuation = build_channel_caption(
+                content, limit=MAX_CAPTION, is_suggested=is_suggested
+            )
             files = await _download_photos(photos[:10])
             if files:
                 try:
@@ -378,11 +471,15 @@ async def send_post_to_channel(
                         f"Could not send photo(s) to channel {channel_id}, falling back to text-only: {photo_err}"
                     )
                     message_ids.clear()
+                    continuation = None  # this caption/continuation pair never got sent
             else:
                 logger.warning(f"Could not download any photos for channel {channel_id}, falling back to text-only")
+                continuation = None
 
         if not photos or not photos_sent:
-            text_caption = build_caption(content, limit=MAX_TEXT, is_suggested=is_suggested)
+            text_caption, continuation = build_channel_caption(
+                content, limit=MAX_TEXT, is_suggested=is_suggested
+            )
             msg = await _retry(lambda: bot.send_message(
                 chat_id=channel_id,
                 text=text_caption,
@@ -394,4 +491,4 @@ async def send_post_to_channel(
         logger.error(f"Error sending post to channel {channel_id}: {e}")
         raise
 
-    return message_ids
+    return message_ids, continuation

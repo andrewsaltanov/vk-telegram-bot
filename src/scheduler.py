@@ -13,6 +13,7 @@ from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.jobstores.memory import MemoryJobStore
 
+import channel_comments
 from keyboards import get_published_notification_keyboard
 from post_sender import send_post_to_channel
 from tg_utils import safe_call
@@ -163,7 +164,7 @@ async def execute_scheduled_post(record_id: int):
             return
 
     try:
-        msg_ids = await send_post_to_channel(
+        msg_ids, continuation_text = await send_post_to_channel(
             bot=_bot,
             channel_id=record["channel_id"],
             content=content,
@@ -173,6 +174,10 @@ async def execute_scheduled_post(record_id: int):
 
         if channel_msg_id:
             await _db.update_scheduled_post_channel_msg_id(record_id, channel_msg_id)
+            if continuation_text:
+                await channel_comments.queue_continuation(
+                    _db, record["channel_id"], channel_msg_id, continuation_text
+                )
 
         await _db.mark_scheduled_post_sent(record_id)
         logger.info(
