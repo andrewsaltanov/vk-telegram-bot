@@ -174,12 +174,12 @@ def build_channel_caption(
 ) -> tuple[str, Optional[str]]:
     """
     Caption for the public channel post. For suggested posts whose text
-    doesn't fit `limit`, truncates without a VK link at all — post_link
-    (the suggestion-queue URL) is dead by the time this is published, and
-    unlike the admin-topic preview there's no author profile worth sending
-    people to on the public channel — and returns the untruncated remainder
-    so the caller can post it as a channel comment instead. Everything else
-    behaves exactly like build_caption().
+    doesn't fit `limit`, drops the VK "see more" link — post_link (the
+    suggestion-queue URL) is dead by the time this is published — but keeps
+    the author-contact footer (people need a way to reach the author about
+    the listing), and returns the untruncated remainder so the caller can
+    post it as a channel comment instead. Everything else behaves exactly
+    like build_caption().
     """
     if not is_suggested:
         return build_caption(content, limit=limit, is_suggested=is_suggested), None
@@ -200,15 +200,15 @@ def build_channel_caption(
     if _html_len(full) <= limit:
         return full, None
 
-    overhead = _html_len(_join(COMMENTS_NOTE, att_str, brand))
+    overhead = _html_len(_join(COMMENTS_NOTE, att_str, footer_full))
     available = limit - overhead - len(SEP) if raw_text else 0
 
     if available > 30:
         truncated = html.escape(plain_text[:available - 1]) + "…"
-        caption = _join(truncated, COMMENTS_NOTE, att_str, brand)
+        caption = _join(truncated, COMMENTS_NOTE, att_str, footer_full)
         remainder = plain_text[available - 1:].strip()
     else:
-        caption = _join(COMMENTS_NOTE, att_str, brand)
+        caption = _join(COMMENTS_NOTE, att_str, footer_full)
         remainder = plain_text
 
     return caption, (remainder or None)
