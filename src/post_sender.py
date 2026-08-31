@@ -109,6 +109,17 @@ def _join(*parts) -> str:
     return SEP.join(p for p in parts if p)
 
 
+def _cut_at_word_boundary(text: str, limit: int) -> int:
+    """Index to slice `text` at for truncation. Prefers the last space at or
+    before `limit` so a word doesn't get split in half; falls back to a hard
+    cut at `limit` if the nearest space is too far back to be worth losing
+    that much text over."""
+    if limit <= 0:
+        return 0
+    space = text.rfind(" ", 0, limit)
+    return space if space >= limit - 40 else limit
+
+
 def build_caption(content: dict, limit: int = MAX_CAPTION, is_suggested: bool = False) -> str:
     """
     Build a Telegram HTML caption for a VK post.
@@ -162,7 +173,8 @@ def build_caption(content: dict, limit: int = MAX_CAPTION, is_suggested: bool = 
 
     if available > 30:
         # Truncate unescaped text so slicing doesn't break HTML entities
-        truncated = html.escape(plain_text[:available - 1]) + "…"
+        cut = _cut_at_word_boundary(plain_text, available - 1)
+        truncated = html.escape(plain_text[:cut].rstrip()) + "…"
         return _join(truncated, see_more, att_str, footer_short)
 
     # No room for text at all — just show see_more
@@ -204,9 +216,10 @@ def build_channel_caption(
     available = limit - overhead - len(SEP) if raw_text else 0
 
     if available > 30:
-        truncated = html.escape(plain_text[:available - 1]) + "…"
+        cut = _cut_at_word_boundary(plain_text, available - 1)
+        truncated = html.escape(plain_text[:cut].rstrip()) + "…"
         caption = _join(truncated, COMMENTS_NOTE, att_str, footer_full)
-        remainder = plain_text[available - 1:].strip()
+        remainder = plain_text[cut:].strip()
     else:
         caption = _join(COMMENTS_NOTE, att_str, footer_full)
         remainder = plain_text
