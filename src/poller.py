@@ -33,7 +33,10 @@ BETWEEN_JOB_CANCELS_DELAY = 0.1
 # a large deletion backlog (e.g. after fixing a detection bug) can otherwise stall
 # an entire poll cycle for tens of minutes, delaying new-post detection for every
 # community. Excess candidates are simply picked up again on the next poll cycle.
-MAX_DELETION_CHECKS_PER_CYCLE = 30
+# BETWEEN_DELETION_CHECKS_DELAY already paces the actual VK API call rate, so
+# raising this cap only affects how much of a large backlog drains per cycle,
+# not how fast individual calls fire.
+MAX_DELETION_CHECKS_PER_CYCLE = 100
 
 # Consecutive poll failures (VK API/network errors, not "no new posts") for a
 # single community before we alert the admins — avoids alerting on one-off blips.
