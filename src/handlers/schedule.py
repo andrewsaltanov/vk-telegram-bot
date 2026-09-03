@@ -355,7 +355,11 @@ async def handle_cancel_sched(
         except JobLookupError:
             pass
     await db.mark_scheduled_post_cancelled(callback_data.record_id)
-    await callback.message.edit_reply_markup(reply_markup=None)
+    # Restore the schedule keyboard so the post can be scheduled again for a
+    # different time, instead of leaving it with no buttons at all.
+    await callback.message.edit_reply_markup(
+        reply_markup=get_schedule_keyboard(record["post_id"])
+    )
     await callback.answer("❌ Публикация отменена", show_alert=True)
 
     # Refresh board so cancelled post disappears from the queue display
