@@ -26,7 +26,7 @@ class Config:
     ADMIN_IDS: List[int]
     COMMUNITIES: List[CommunityConfig]
     POLL_INTERVAL: int = 300
-    INITIAL_POSTS_COUNT: int = 30
+    INITIAL_POSTS_COUNT: int = 10
     DB_PATH: str = "/app/data/bot.db"
     TIMEZONE: str = "Europe/Moscow"
     COMMUNITIES_FILE: str = "/app/communities.json"

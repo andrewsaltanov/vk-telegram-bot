@@ -19,6 +19,7 @@ from typing import Optional
 from aiogram import Bot
 from aiogram.types import Message, MessageOriginChannel
 
+from config import Config
 from database import Database
 from post_sender import build_continuation_messages
 from tg_utils import safe_call
@@ -103,7 +104,7 @@ async def _send_continuation(
     await db.mark_continuation_sent(pending["id"])
 
 
-async def flush_stale_continuations(bot: Bot, db: Database):
+async def flush_stale_continuations(bot: Bot, db: Database, config: Config):
     """Called once per VK poll cycle: fallback-post any continuation whose
     discussion-group mirror never showed up in time."""
     cutoff = int(time.time()) - PENDING_TIMEOUT_SECONDS
@@ -115,5 +116,24 @@ async def flush_stale_continuations(bot: Bot, db: Database):
                 f"{row['channel_id']}, marking failed"
             )
             await db.mark_continuation_failed(row["id"])
+            await _notify_continuation_failed(bot, db, config, row["channel_id"])
             continue
         await _send_continuation(bot, linked_chat_id, None, row, db)
+
+
+async def _notify_continuation_failed(bot: Bot, db: Database, config: Config, channel_id: int):
+    community = await db.get_community_by_channel_id(channel_id)
+    if not community or not community.get("published_topic_id"):
+        return
+    await safe_call(
+        bot.send_message(
+            chat_id=config.GROUP_ID,
+            text=(
+                "⚠️ Не удалось опубликовать продолжение комментария к посту — "
+                f"проверьте обсуждения канала «{community.get('name', channel_id)}»"
+            ),
+            message_thread_id=community["published_topic_id"],
+        ),
+        logger,
+        f"Could not send continuation-failure notice for channel {channel_id}",
+    )

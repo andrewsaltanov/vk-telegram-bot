@@ -14,7 +14,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.jobstores.memory import MemoryJobStore
 
 import channel_comments
-from keyboards import get_published_notification_keyboard
+from keyboards import get_failed_publish_keyboard, get_published_notification_keyboard
 from post_sender import send_post_to_channel
 from tg_utils import safe_call
 from vk_client import VKClient
@@ -164,7 +164,7 @@ async def execute_scheduled_post(record_id: int):
             return
 
     try:
-        msg_ids, continuation_text = await send_post_to_channel(
+        msg_ids, continuation_text, photos_failed = await send_post_to_channel(
             bot=_bot,
             channel_id=record["channel_id"],
             content=content,
@@ -205,11 +205,12 @@ async def execute_scheduled_post(record_id: int):
             tz = _config.tz
             time_str = datetime.now(tz).strftime("%d.%m.%Y %H:%M")
             update_line = "\n📝 Текст обновился на VK — опубликована актуальная версия" if content_was_updated else ""
+            photo_fail_line = "\n⚠️ Фото не загрузились — опубликован только текст" if photos_failed else ""
 
             await safe_call(
                 _bot.send_message(
                     chat_id=_config.GROUP_ID,
-                    text=f'📢 Опубликовано в канале {time_str}{update_line}\n<a href="{link}">Ссылка на пост</a>',
+                    text=f'📢 Опубликовано в канале {time_str}{update_line}{photo_fail_line}\n<a href="{link}">Ссылка на пост</a>',
                     parse_mode="HTML",
                     message_thread_id=orig_post.get("tg_topic_id"),
                     reply_to_message_id=orig_post.get("tg_message_id"),
@@ -222,6 +223,30 @@ async def execute_scheduled_post(record_id: int):
 
     except Exception as e:
         logger.error(f"Failed to send scheduled post {record_id}: {e}")
+        await _db.mark_scheduled_post_failed(record_id)
+
+        if orig_post and _config:
+            failed_keyboard = get_failed_publish_keyboard(record_id)
+            await safe_call(
+                _bot.edit_message_reply_markup(
+                    chat_id=_config.GROUP_ID,
+                    message_id=orig_post.get("tg_message_id"),
+                    reply_markup=failed_keyboard,
+                ),
+                logger,
+                f"Could not update keyboard for failed post {record_id}",
+            )
+            await safe_call(
+                _bot.send_message(
+                    chat_id=_config.GROUP_ID,
+                    text=f"❌ Не удалось опубликовать пост в канале: {e}",
+                    message_thread_id=orig_post.get("tg_topic_id"),
+                    reply_to_message_id=orig_post.get("tg_message_id"),
+                    reply_markup=failed_keyboard,
+                ),
+                logger,
+                "Could not send failed-publish notification",
+            )
 
 
 # ── Startup reload ─────────────────────────────────────────────────────────────

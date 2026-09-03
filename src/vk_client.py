@@ -94,7 +94,11 @@ class VKClient:
 
     async def get_wall_posts(
         self, community_id: int, count: int = 50, offset: int = 0
-    ) -> List[dict]:
+    ) -> Optional[List[dict]]:
+        """Returns the post list, or None if the VK API call itself failed
+        (rate limit exhausted, network error, bad token) — as opposed to an
+        empty list, which means the call succeeded and there's simply nothing
+        new. Callers use this distinction to detect a broken community."""
         # Requires user admin token — group tokens are not supported (VK error 27)
         if not self.user_token:
             logger.warning(
@@ -102,7 +106,7 @@ class VKClient:
                 "wall.get requires a user admin token. Add 'user_token' to communities.json "
                 "or set VK_USER_TOKEN in .env. Get it at https://vkhost.github.io/"
             )
-            return []
+            return None
         result = await self._call(
             "wall.get",
             {
@@ -113,19 +117,21 @@ class VKClient:
             },
             use_user_token=True,
         )
-        if not result:
-            return []
+        if result is None:
+            return None
         return result.get("items", [])
 
     async def get_suggested_posts(
         self, community_id: int, count: int = 50, offset: int = 0
-    ) -> List[dict]:
+    ) -> Optional[List[dict]]:
+        """See get_wall_posts() — None means the API call failed, [] means it
+        succeeded with no results."""
         if not self.user_token:
             logger.warning(
                 f"No user_token for community {community_id}. "
                 "Suggested posts require a user admin token."
             )
-            return []
+            return None
         result = await self._call(
             "wall.get",
             {
@@ -136,8 +142,8 @@ class VKClient:
             },
             use_user_token=True,
         )
-        if not result:
-            return []
+        if result is None:
+            return None
         return result.get("items", [])
 
     async def post_exists(self, community_id: int, post_id: int) -> bool:

@@ -17,6 +17,7 @@ from config import Config
 from database import Database
 from keyboards import get_schedule_keyboard
 from post_sender import send_vk_post_to_topic
+from tg_utils import safe_call
 from vk_client import VKClient
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,10 @@ BETWEEN_JOB_CANCELS_DELAY = 0.1
 # community. Excess candidates are simply picked up again on the next poll cycle.
 MAX_DELETION_CHECKS_PER_CYCLE = 30
 
+# Consecutive poll failures (VK API/network errors, not "no new posts") for a
+# single community before we alert the admins — avoids alerting on one-off blips.
+POLL_FAIL_ALERT_THRESHOLD = 3
+
 
 class VKPoller:
     def __init__(self, bot: Bot, db: Database, config: Config, scheduler: AsyncIOScheduler):
@@ -42,6 +47,10 @@ class VKPoller:
         self.config = config
         self.scheduler = scheduler
         self.running = False
+        # (community_id, post_type) -> consecutive VK API/network failures.
+        # In-memory only (resets on restart) — this only paces admin alerts,
+        # nothing depends on it surviving a restart.
+        self._poll_fail_counts: dict[tuple[int, str], int] = {}
 
     async def start(self):
         self.running = True
@@ -79,7 +88,7 @@ class VKPoller:
             await asyncio.sleep(BETWEEN_COMMUNITIES_DELAY)
 
         try:
-            await channel_comments.flush_stale_continuations(self.bot, self.db)
+            await channel_comments.flush_stale_continuations(self.bot, self.db, self.config)
         except Exception as e:
             logger.error(f"Error flushing stale comment continuations: {e}", exc_info=True)
 
@@ -107,8 +116,11 @@ class VKPoller:
         else:
             vk_posts = await vk.get_suggested_posts(community_id, count=50)
 
+        fail_key = (community_id, post_type)
         if vk_posts is None:
+            await self._note_poll_failure(community, post_type, fail_key)
             return
+        await self._note_poll_recovery(community, post_type, fail_key)
 
         # Sort oldest → newest by publication date
         vk_posts.sort(key=lambda p: p.get("date", p["id"]))
@@ -146,6 +158,42 @@ class VKPoller:
         # Detect deleted posts
         current_vk_ids = {p["id"] for p in vk_posts}
         await self._check_deletions(vk, community, post_type, current_vk_ids)
+
+    # ── Poll failure tracking / admin alerts ─────────────────────────────────────
+
+    async def _note_poll_failure(self, community: dict, post_type: str, fail_key: tuple):
+        count = self._poll_fail_counts.get(fail_key, 0) + 1
+        self._poll_fail_counts[fail_key] = count
+        if count == POLL_FAIL_ALERT_THRESHOLD:
+            label = "публикаций" if post_type == "published" else "предложки"
+            await safe_call(
+                self.bot.send_message(
+                    chat_id=self.config.GROUP_ID,
+                    text=(
+                        f"⚠️ Сообщество «{community.get('name', community['vk_id'])}» "
+                        f"({label}): ошибка опроса VK {count} циклов подряд — "
+                        "проверьте токен/доступ."
+                    ),
+                ),
+                logger,
+                "Could not send poll-failure alert",
+            )
+
+    async def _note_poll_recovery(self, community: dict, post_type: str, fail_key: tuple):
+        count = self._poll_fail_counts.pop(fail_key, 0)
+        if count >= POLL_FAIL_ALERT_THRESHOLD:
+            label = "публикаций" if post_type == "published" else "предложки"
+            await safe_call(
+                self.bot.send_message(
+                    chat_id=self.config.GROUP_ID,
+                    text=(
+                        f"✅ Опрос VK для «{community.get('name', community['vk_id'])}» "
+                        f"({label}) восстановлен."
+                    ),
+                ),
+                logger,
+                "Could not send poll-recovery notice",
+            )
 
     # ── Deletion check ────────────────────────────────────────────────────────
 

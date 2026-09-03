@@ -125,6 +125,9 @@ def build_caption(content: dict, limit: int = MAX_CAPTION, is_suggested: bool = 
     Build a Telegram HTML caption for a VK post.
 
     For suggested posts: footer shows a link to the author's VK page instead of 📌 Оригинал в VK.
+    For regular (published) posts: footer shows 📌 Оригинал в VK, plus 👤 a link
+    to the author when they're an identifiable person (not just the community
+    itself) — so readers know who to contact.
     If text fits:   text + attachments + footer + brand
     If truncated:   text… + 🔍 Полный пост... + attachments + brand
                     (footer link omitted — 🔍 already links to the post)
@@ -136,6 +139,10 @@ def build_caption(content: dict, limit: int = MAX_CAPTION, is_suggested: bool = 
     """
     post_link = content.get("post_link", "")
     author_link = content.get("author_link", "")
+    # get_author_link() falls back to the community's own page when the post
+    # has no identifiable individual author — only a "vk.com/id..." link is a
+    # real person worth surfacing separately from the community/post link.
+    author_is_person = author_link.startswith("https://vk.com/id")
 
     brand = f'<a href="{html.escape(BRAND_LINK)}">{html.escape(BRAND_TEXT)}</a>'
 
@@ -143,7 +150,12 @@ def build_caption(content: dict, limit: int = MAX_CAPTION, is_suggested: bool = 
     if is_suggested and author_link:
         footer_full = f'👤 <a href="{html.escape(author_link)}">Ссылка на автора поста в VK</a>\n\n{brand}'
     elif post_link:
-        footer_full = f'📌 <a href="{html.escape(post_link)}">Оригинал в VK</a>\n\n{brand}'
+        author_line = (
+            f'👤 <a href="{html.escape(author_link)}">Автор поста в VK</a>\n'
+            if author_is_person
+            else ""
+        )
+        footer_full = f'{author_line}📌 <a href="{html.escape(post_link)}">Оригинал в VK</a>\n\n{brand}'
     else:
         footer_full = brand
 
@@ -326,8 +338,10 @@ async def send_vk_post_to_topic(
                 btn_msg = await _retry(lambda: bot.send_message(
                     chat_id=chat_id,
                     text=(
-                        "⚠️ <b>Пост слишком длинный для автоматической публикации.</b>\n"
-                        "Разместите его в канале вручную.\n\n"
+                        "⚠️ <b>Текст длиннее лимита подписи Telegram.</b>\n"
+                        "При планировании через кнопки он будет автоматически "
+                        "сокращён (со ссылкой на продолжение), либо разместите "
+                        "вручную.\n\n"
                         "📋 Действия с постом:"
                     ),
                     parse_mode="HTML",
@@ -439,22 +453,41 @@ async def send_post_to_channel(
     channel_id: int,
     content: dict,
     is_suggested: bool = False,
-) -> tuple[List[int], Optional[str]]:
+) -> tuple[List[int], Optional[str], bool]:
     """
-    Returns (message_ids, continuation_text). continuation_text is set when a
-    suggested post's caption had to be truncated — the caller is expected to
-    post it as a channel comment (see channel_comments.py).
+    Returns (message_ids, continuation_text, photos_failed). continuation_text
+    is set when a post's text still doesn't fit even the standalone text
+    message (>4096 chars, rare) — the caller is expected to post it as a
+    channel comment (see channel_comments.py).
+    photos_failed is True when the post had photos but they could not be sent
+    and the post fell back to a text-only message.
+
+    When a photo post's text doesn't fit a 1024-char caption, photos are sent
+    as a bare album and the full text follows as its own reply message (up to
+    4096 chars — the text-message limit, not the tighter caption limit),
+    wrapped in a collapsible <blockquote expandable> so it doesn't dominate
+    the channel feed. Short posts keep the single photo+caption message.
     """
     photos = content.get("photos", [])
     message_ids: List[int] = []
     continuation: Optional[str] = None
+    photos_failed = False
+    split_body = False  # True once photos were sent without a caption
 
     try:
         photos_sent = False
+        album_anchor_id: Optional[int] = None
         if photos:
-            caption, continuation = build_channel_caption(
-                content, limit=MAX_CAPTION, is_suggested=is_suggested
+            full_untruncated, _ = build_channel_caption(
+                content, limit=999_999, is_suggested=is_suggested
             )
+            fits_as_caption = _html_len(full_untruncated) <= MAX_CAPTION
+            caption: Optional[str] = None
+            if fits_as_caption:
+                caption, continuation = build_channel_caption(
+                    content, limit=MAX_CAPTION, is_suggested=is_suggested
+                )
+
             files = await _download_photos(photos[:10])
             if files:
                 try:
@@ -463,20 +496,24 @@ async def send_post_to_channel(
                             chat_id=channel_id,
                             photo=files[0],
                             caption=caption,
-                            parse_mode="HTML",
+                            parse_mode="HTML" if caption else None,
                         ))
                         message_ids.append(msg.message_id)
+                        album_anchor_id = msg.message_id
                     else:
-                        # Album — caption on first photo
+                        # Album — caption (if any) on first photo
                         media = [InputMediaPhoto(media=f) for f in files]
-                        media[0].caption = caption
-                        media[0].parse_mode = "HTML"
+                        if caption:
+                            media[0].caption = caption
+                            media[0].parse_mode = "HTML"
                         msgs = await _retry(lambda: bot.send_media_group(
                             chat_id=channel_id,
                             media=media,
                         ))
                         message_ids.extend(m.message_id for m in msgs)
+                        album_anchor_id = msgs[0].message_id
                     photos_sent = True
+                    split_body = not fits_as_caption
                 except Exception as photo_err:
                     # Fall back to text-only rather than silently losing a paid
                     # channel publication.
@@ -485,23 +522,28 @@ async def send_post_to_channel(
                     )
                     message_ids.clear()
                     continuation = None  # this caption/continuation pair never got sent
+                    photos_failed = True
             else:
                 logger.warning(f"Could not download any photos for channel {channel_id}, falling back to text-only")
                 continuation = None
+                photos_failed = True
 
-        if not photos or not photos_sent:
+        if not photos or not photos_sent or split_body:
             text_caption, continuation = build_channel_caption(
                 content, limit=MAX_TEXT, is_suggested=is_suggested
             )
+            if split_body:
+                text_caption = f"<blockquote expandable>{text_caption}</blockquote>"
             msg = await _retry(lambda: bot.send_message(
                 chat_id=channel_id,
                 text=text_caption,
                 parse_mode="HTML",
                 disable_web_page_preview=True,
+                reply_to_message_id=album_anchor_id if split_body else None,
             ))
             message_ids.append(msg.message_id)
     except Exception as e:
         logger.error(f"Error sending post to channel {channel_id}: {e}")
         raise
 
-    return message_ids, continuation
+    return message_ids, continuation, photos_failed

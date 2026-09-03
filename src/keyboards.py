@@ -5,13 +5,16 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from callbacks import (
+    CancelCustomTimeCallback,
     CancelSchedCallback,
     DelChannelCallback,
     ManualDoneCallback,
     ManualInfoCallback,
     RescheduleCallback,
+    RetryPublishCallback,
     ScheduleCallback,
     SchedInfoCallback,
+    UndoManualCallback,
 )
 
 # Schedule options: (label, minutes)
@@ -87,7 +90,8 @@ def get_manual_post_keyboard(post_db_id: int) -> InlineKeyboardMarkup:
 def get_manually_placed_badge(
     post_db_id: int, unix_ts: int, timezone: str = "Europe/Moscow"
 ) -> InlineKeyboardMarkup:
-    """Бейдж ручного размещения; при нажатии показывает алерт с датой."""
+    """Бейдж ручного размещения; при нажатии показывает алерт с датой. Кнопка
+    отмены на случай случайного нажатия «Размещён вручную»."""
     dt = datetime.fromtimestamp(unix_ts, tz=ZoneInfo(timezone))
     time_str = dt.strftime("%d.%m %H:%M")
     builder = InlineKeyboardBuilder()
@@ -95,6 +99,11 @@ def get_manually_placed_badge(
         text=f"✅ Размещён вручную {time_str}",
         callback_data=ManualInfoCallback(post_db_id=post_db_id, unix_ts=unix_ts).pack(),
     )
+    builder.button(
+        text="↩️ Отменить",
+        callback_data=UndoManualCallback(post_db_id=post_db_id).pack(),
+    )
+    builder.adjust(1)
     return builder.as_markup()
 
 
@@ -124,6 +133,26 @@ def get_scheduled_badge(
             ).pack(),
         )
         builder.adjust(1)
+    return builder.as_markup()
+
+
+def get_failed_publish_keyboard(record_id: int) -> InlineKeyboardMarkup:
+    """Клавиатура для неудачной публикации по расписанию — кнопка повтора."""
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="🔁 Повторить",
+        callback_data=RetryPublishCallback(record_id=record_id).pack(),
+    )
+    return builder.as_markup()
+
+
+def get_custom_time_cancel_keyboard(post_db_id: int) -> InlineKeyboardMarkup:
+    """Кнопка отмены под промптом ввода кастомного времени."""
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="❌ Отмена",
+        callback_data=CancelCustomTimeCallback(post_db_id=post_db_id).pack(),
+    )
     return builder.as_markup()
 
 

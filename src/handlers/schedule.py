@@ -14,11 +14,18 @@ from aiogram.types import CallbackQuery, Message
 from apscheduler.jobstores.base import JobLookupError
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from callbacks import CancelSchedCallback, RescheduleCallback, ScheduleCallback, SchedInfoCallback
+from callbacks import (
+    CancelCustomTimeCallback,
+    CancelSchedCallback,
+    RescheduleCallback,
+    RetryPublishCallback,
+    ScheduleCallback,
+    SchedInfoCallback,
+)
 from config import Config
 from database import Database
 from filters import IsAdmin
-from keyboards import get_schedule_keyboard, get_scheduled_badge
+from keyboards import get_custom_time_cancel_keyboard, get_schedule_keyboard, get_scheduled_badge
 from schedule_board import refresh_schedule_board
 from scheduler import execute_scheduled_post
 from tg_utils import safe_call
@@ -60,6 +67,7 @@ async def handle_schedule_callback(
             "<code>ДД.ММ.ГГГГ ЧЧ:ММ</code> — конкретная дата\n\n"
             f"Часовой пояс: <b>{config.TIMEZONE}</b>",
             parse_mode="HTML",
+            reply_markup=get_custom_time_cancel_keyboard(post_db_id),
         )
         await callback.answer()
         return
@@ -72,7 +80,36 @@ async def handle_schedule_callback(
     await _do_schedule(callback, db, scheduler, post_db_id, schedule_time, bot, config)
 
 
-@router.message(ScheduleStates.waiting_custom_time)
+@router.callback_query(CancelCustomTimeCallback.filter())
+async def handle_cancel_custom_time(
+    callback: CallbackQuery,
+    callback_data: CancelCustomTimeCallback,
+    state: FSMContext,
+    config: Config,
+):
+    if not await _require_admin(callback, config):
+        return
+    await state.clear()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer("Отменено")
+
+
+@router.message(Command("cancel"), IsAdmin())
+async def cmd_cancel(message: Message, state: FSMContext):
+    if await state.get_state() is None:
+        await message.reply("ℹ️ Нечего отменять.")
+        return
+    await state.clear()
+    await message.reply("❌ Ввод времени отменён.")
+
+
+def _not_a_command(message: Message) -> bool:
+    return not (message.text or "").startswith("/")
+
+
+# Commands (e.g. /status) must not be swallowed as an invalid time string
+# while this FSM state is active — only plain text is treated as a time entry.
+@router.message(ScheduleStates.waiting_custom_time, _not_a_command)
 async def handle_custom_time_input(
     message: Message,
     state: FSMContext,
@@ -329,6 +366,28 @@ async def handle_cancel_sched(
             logger,
             "Could not refresh schedule board after cancel",
         )
+
+
+# ── Retry a failed publication ───────────────────────────────────────────────
+
+@router.callback_query(RetryPublishCallback.filter())
+async def handle_retry_publish(
+    callback: CallbackQuery,
+    callback_data: RetryPublishCallback,
+    db: Database,
+    config: Config,
+):
+    if not await _require_admin(callback, config):
+        return
+
+    record = await db.get_scheduled_post_record(callback_data.record_id)
+    if not record or record["status"] != "failed":
+        await callback.answer("Публикация уже не в статусе ошибки", show_alert=True)
+        return
+
+    await db.reset_scheduled_post_pending(callback_data.record_id)
+    await callback.answer("🔁 Повторяем публикацию…")
+    await execute_scheduled_post(callback_data.record_id)
 
 
 # ── Reschedule ───────────────────────────────────────────────────────────────

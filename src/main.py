@@ -26,6 +26,12 @@ logger = logging.getLogger(__name__)
 async def main():
     config = load_config()
 
+    if not config.ADMIN_IDS:
+        logger.warning(
+            "ADMIN_IDS is empty — the bot is unrestricted, every Telegram user can "
+            "use admin commands and buttons. Set ADMIN_IDS in .env to restrict access."
+        )
+
     db_dir = os.path.dirname(config.DB_PATH)
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)

@@ -35,3 +35,15 @@ class DelChannelCallback(CallbackData, prefix="del_channel"):
 class RescheduleCallback(CallbackData, prefix="reschedule"):
     post_db_id: int
     record_id: int
+
+
+class RetryPublishCallback(CallbackData, prefix="retry_pub"):
+    record_id: int
+
+
+class CancelCustomTimeCallback(CallbackData, prefix="cancel_custom"):
+    post_db_id: int
+
+
+class UndoManualCallback(CallbackData, prefix="undo_manual"):
+    post_db_id: int

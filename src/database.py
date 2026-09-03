@@ -298,6 +298,18 @@ class Database:
         )
         await self._conn.commit()
 
+    async def mark_scheduled_post_failed(self, record_id: int):
+        await self._conn.execute(
+            "UPDATE scheduled_channel_posts SET status = 'failed' WHERE id = ?", (record_id,)
+        )
+        await self._conn.commit()
+
+    async def reset_scheduled_post_pending(self, record_id: int):
+        await self._conn.execute(
+            "UPDATE scheduled_channel_posts SET status = 'pending' WHERE id = ?", (record_id,)
+        )
+        await self._conn.commit()
+
     async def update_scheduled_post_channel_msg_id(self, record_id: int, channel_msg_id: int):
         await self._conn.execute(
             "UPDATE scheduled_channel_posts SET channel_message_id = ? WHERE id = ?",
@@ -404,6 +416,13 @@ class Database:
         async with self._conn.execute(
             "SELECT * FROM communities WHERE published_topic_id = ? OR suggested_topic_id = ?",
             (topic_id, topic_id),
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def get_community_by_channel_id(self, channel_id: int) -> Optional[dict]:
+        async with self._conn.execute(
+            "SELECT * FROM communities WHERE channel_id = ?", (channel_id,)
         ) as cur:
             row = await cur.fetchone()
             return dict(row) if row else None

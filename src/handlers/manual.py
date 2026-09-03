@@ -6,10 +6,10 @@ from aiogram import Router, Bot
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery
 
-from callbacks import DelChannelCallback, ManualDoneCallback, ManualInfoCallback
+from callbacks import DelChannelCallback, ManualDoneCallback, ManualInfoCallback, UndoManualCallback
 from config import Config
 from database import Database
-from keyboards import get_manually_placed_badge
+from keyboards import get_manual_post_keyboard, get_manually_placed_badge
 from tg_utils import safe_call
 
 from .common import _require_admin
@@ -63,6 +63,50 @@ async def handle_manual_done(
         ),
         logger,
         f"Could not send manual marker for post {callback_data.post_db_id}",
+    )
+
+
+@router.callback_query(UndoManualCallback.filter())
+async def handle_undo_manual(
+    callback: CallbackQuery,
+    callback_data: UndoManualCallback,
+    db: Database,
+    bot: Bot,
+    config: Config,
+):
+    if not await _require_admin(callback, config):
+        return
+
+    post = await db.get_post_by_id(callback_data.post_db_id)
+    if not post:
+        await callback.answer("❌ Пост не найден", show_alert=True)
+        return
+
+    tg_msg_id = post.get("tg_message_id")
+    topic_id = post.get("tg_topic_id")
+
+    await callback.answer("↩️ Отметка отменена", show_alert=True)
+
+    if tg_msg_id:
+        await safe_call(
+            bot.edit_message_reply_markup(
+                chat_id=config.GROUP_ID,
+                message_id=tg_msg_id,
+                reply_markup=get_manual_post_keyboard(callback_data.post_db_id),
+            ),
+            logger,
+            f"Could not restore keyboard for post {callback_data.post_db_id}",
+        )
+
+    await safe_call(
+        bot.send_message(
+            chat_id=config.GROUP_ID,
+            text="↩️ Отметка «размещён вручную» отменена",
+            message_thread_id=topic_id,
+            reply_to_message_id=tg_msg_id,
+        ),
+        logger,
+        f"Could not send undo marker for post {callback_data.post_db_id}",
     )
 
 
