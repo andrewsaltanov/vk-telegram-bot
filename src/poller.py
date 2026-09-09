@@ -5,6 +5,7 @@ Each community uses its own VK token and posts to its own Telegram channel.
 import asyncio
 import json
 import logging
+import time
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
@@ -41,6 +42,17 @@ MAX_DELETION_CHECKS_PER_CYCLE = 100
 # Consecutive poll failures (VK API/network errors, not "no new posts") for a
 # single community before we alert the admins — avoids alerting on one-off blips.
 POLL_FAIL_ALERT_THRESHOLD = 3
+
+# How long a stored post stays eligible for deletion checking. Communities where
+# suggested-post submissions vastly outnumber owner posts share VK's global wall
+# post-id counter with those submissions, so the last 50 owner posts can span a
+# huge id range — min_vk_id (see _check_deletions) then stays far below almost
+# the entire post history forever, turning it into a permanent, ever-growing
+# deletion-check backlog (observed in production: a post from ~6 months ago was
+# still being re-checked every single poll cycle). Moderation removals happen
+# shortly after publication in practice, so bounding by age keeps the candidate
+# pool small without missing real deletions.
+MAX_DELETION_CHECK_AGE_SECONDS = 7 * 24 * 3600
 
 
 class VKPoller:
@@ -222,12 +234,15 @@ class VKPoller:
         # Posts older than the batch's oldest ID can't appear in a 50-post fetch,
         # so calling post_exists() for them every cycle burns API quota needlessly.
         min_vk_id = min(current_vk_ids)
+        min_created_at = time.time() - MAX_DELETION_CHECK_AGE_SECONDS
         stored_posts = await self.db.get_posts_by_community(
             community["vk_id"], post_type
         )
         candidates = [
             s for s in stored_posts
-            if s["vk_post_id"] >= min_vk_id and s["vk_post_id"] not in current_vk_ids
+            if s["vk_post_id"] >= min_vk_id
+            and s["vk_post_id"] not in current_vk_ids
+            and s["created_at"] >= min_created_at
         ]
         candidates.sort(key=lambda s: s["vk_post_id"])  # oldest first — drain backlog in order
 
