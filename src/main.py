@@ -61,18 +61,27 @@ async def main():
     await setup_communities(bot, db, config)
 
     # VK polling loop
-    poller = VKPoller(bot=bot, db=db, config=config, scheduler=scheduler)
-    poller_task = asyncio.create_task(poller.start())
+    poller_task = None
+    if config.POLL_ENABLED:
+        poller = VKPoller(bot=bot, db=db, config=config, scheduler=scheduler)
+        poller_task = asyncio.create_task(poller.start())
+    else:
+        logger.warning(
+            "VK polling disabled (VK_POLLING_ENABLED=false) — the bot will still "
+            "handle Telegram commands and fire already-scheduled publications, "
+            "but won't fetch new VK posts."
+        )
 
     logger.info("Bot is running. Press Ctrl+C to stop.")
     try:
         await dp.start_polling(bot, db=db, config=config, scheduler=scheduler)
     finally:
-        poller_task.cancel()
-        try:
-            await poller_task
-        except asyncio.CancelledError:
-            pass
+        if poller_task:
+            poller_task.cancel()
+            try:
+                await poller_task
+            except asyncio.CancelledError:
+                pass
         scheduler.shutdown(wait=False)
         await db.close()
         await bot.session.close()

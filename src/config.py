@@ -26,6 +26,7 @@ class Config:
     ADMIN_IDS: List[int]
     COMMUNITIES: List[CommunityConfig]
     POLL_INTERVAL: int = 300
+    POLL_ENABLED: bool = True
     INITIAL_POSTS_COUNT: int = 10
     DB_PATH: str = "/app/data/bot.db"
     TIMEZONE: str = "Europe/Moscow"
@@ -78,6 +79,7 @@ def load_config() -> Config:
         ADMIN_IDS=admin_ids,
         COMMUNITIES=communities,
         POLL_INTERVAL=int(os.environ.get("POLL_INTERVAL", "300")),
+        POLL_ENABLED=os.environ.get("VK_POLLING_ENABLED", "true").strip().lower() not in ("0", "false", "no"),
         INITIAL_POSTS_COUNT=int(os.environ.get("INITIAL_POSTS_COUNT", "10")),
         DB_PATH=os.environ.get("DB_PATH", "/app/data/bot.db"),
         TIMEZONE=os.environ.get("TIMEZONE", "Europe/Moscow"),
