@@ -78,7 +78,9 @@ def load_config() -> Config:
         GROUP_ID=int(os.environ["GROUP_ID"]),
         ADMIN_IDS=admin_ids,
         COMMUNITIES=communities,
-        POLL_INTERVAL=int(os.environ.get("POLL_INTERVAL", "300")),
+        # VK's Sept 2026 policy caps unverified apps at 10,000 API calls/month —
+        # each cycle burns 2 wall.get calls per community, so 300s was ~5x over budget.
+        POLL_INTERVAL=int(os.environ.get("POLL_INTERVAL", "3600")),
         POLL_ENABLED=os.environ.get("VK_POLLING_ENABLED", "true").strip().lower() not in ("0", "false", "no"),
         INITIAL_POSTS_COUNT=int(os.environ.get("INITIAL_POSTS_COUNT", "10")),
         DB_PATH=os.environ.get("DB_PATH", "/app/data/bot.db"),
