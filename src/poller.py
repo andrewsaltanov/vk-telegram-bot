@@ -73,22 +73,31 @@ class VKPoller:
     async def start(self):
         self.running = True
         logger.info(
-            f"VK Poller started (interval={self.config.POLL_INTERVAL}s, "
+            f"VK Poller started (suggested interval={self.config.POLL_INTERVAL}s, "
+            f"published safety-net interval={self.config.PUBLISHED_SAFETY_POLL_INTERVAL}s, "
             f"communities={[c.group_id for c in self.config.COMMUNITIES]})"
         )
+        tick = 0
         while self.running:
             try:
-                await self._poll_all()
+                await self._poll_all(check_published=self._should_check_published(tick))
             except Exception as e:
                 logger.error(f"Polling cycle error: {e}", exc_info=True)
+            tick += 1
             await asyncio.sleep(self.config.POLL_INTERVAL)
 
     def stop(self):
         self.running = False
 
+    def _published_check_every_n_ticks(self) -> int:
+        return max(1, self.config.PUBLISHED_SAFETY_POLL_INTERVAL // self.config.POLL_INTERVAL)
+
+    def _should_check_published(self, tick: int) -> bool:
+        return tick % self._published_check_every_n_ticks() == 0
+
     # ── Main cycle ────────────────────────────────────────────────────────────
 
-    async def _poll_all(self):
+    async def _poll_all(self, check_published: bool):
         communities = await self.db.get_communities()
         for community in communities:
             # Get per-community VK token from config
@@ -98,7 +107,7 @@ class VKPoller:
                 continue
             try:
                 async with VKClient(comm_cfg.token, user_token=comm_cfg.user_token) as vk:
-                    await self._poll_community(vk, community)
+                    await self._poll_community(vk, community, check_published)
             except Exception as e:
                 logger.error(
                     f"Error polling community {community['vk_id']}: {e}", exc_info=True
@@ -110,8 +119,11 @@ class VKPoller:
         except Exception as e:
             logger.error(f"Error flushing stale comment continuations: {e}", exc_info=True)
 
-    async def _poll_community(self, vk: VKClient, community: dict):
-        if community.get("published_topic_id"):
+    async def _poll_community(self, vk: VKClient, community: dict, check_published: bool):
+        # "published" now arrives in real time via VK Bots Long Poll (see
+        # long_poll.py) — this periodic check only runs occasionally, as a
+        # deletion-detection safety net and catch-up for anything Long Poll missed.
+        if check_published and community.get("published_topic_id"):
             await self._poll_wall(vk, community, "published")
             await asyncio.sleep(BETWEEN_WALL_TYPES_DELAY)
         if community.get("suggested_topic_id"):
