@@ -140,10 +140,19 @@ class VKPoller:
         topic_id = community.get("published_topic_id")
         if not topic_id:
             return
-        last_known_id = community.get("last_post_id", 0)
-        if post["id"] > last_known_id:
-            await self.db.update_community_last_id(vk_id, "published", post["id"])
+        post_id = post.get("id")
+        if not isinstance(post_id, int):
+            logger.warning(f"wall_post_new for {vk_id} has no usable post id, ignoring: {post!r}")
+            return
+        # Send first, bump last_post_id only after it succeeds — otherwise a
+        # crash between the bump and the send would permanently skip this
+        # post: the safety-net poll's id > last_known_id filter would never
+        # re-offer it. _send_post is idempotent (dedups via save_post_get_id's
+        # UNIQUE constraint), so it's safe to call again on a safety-net retry.
         await self._send_post(community, post, topic_id, "published")
+        last_known_id = community.get("last_post_id", 0)
+        if post_id > last_known_id:
+            await self.db.update_community_last_id(vk_id, "published", post_id)
 
     # ── Wall polling ──────────────────────────────────────────────────────────
 

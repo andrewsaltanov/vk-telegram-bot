@@ -62,23 +62,25 @@ async def main():
     await setup_communities(bot, db, config)
 
     # VK polling loop + Long Poll listeners share one VKPoller instance — the
-    # listeners need handle_new_published_post() even when
-    # VK_POLLING_ENABLED=false, so the poller is always constructed.
+    # listeners need handle_new_published_post() to exist, but neither is
+    # actually started when VK_POLLING_ENABLED=false, so constructing the
+    # poller unconditionally is moot in that case.
     poller = VKPoller(bot=bot, db=db, config=config, scheduler=scheduler)
     poller_task = None
+    long_poll_tasks = []
     if config.POLL_ENABLED:
         poller_task = asyncio.create_task(poller.start())
+        long_poll_tasks = [
+            asyncio.create_task(run_long_poll(comm_cfg, poller))
+            for comm_cfg in config.COMMUNITIES
+        ]
     else:
         logger.warning(
             "VK polling disabled (VK_POLLING_ENABLED=false) — the bot will still "
             "handle Telegram commands and fire already-scheduled publications, "
-            "but won't fetch new VK posts. VK Bots Long Poll still runs."
+            "but won't fetch new VK posts: both the wall.get poll and VK Bots "
+            "Long Poll are off."
         )
-
-    long_poll_tasks = [
-        asyncio.create_task(run_long_poll(comm_cfg, poller))
-        for comm_cfg in config.COMMUNITIES
-    ]
 
     logger.info("Bot is running. Press Ctrl+C to stop.")
     try:
