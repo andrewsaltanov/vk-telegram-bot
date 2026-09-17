@@ -161,7 +161,7 @@ class VKPoller:
         # Send new posts — small delay, flood control handled by retry in post_sender
         for post in posts_to_send:
             try:
-                await self._send_post(vk, community, post, topic_id, post_type)
+                await self._send_post(community, post, topic_id, post_type)
             except TelegramBadRequest as e:
                 if "thread" in str(e).lower():
                     logger.warning(
@@ -267,7 +267,6 @@ class VKPoller:
 
     async def _send_post(
         self,
-        vk: VKClient,
         community: dict,
         post: dict,
         topic_id: int,
@@ -275,9 +274,9 @@ class VKPoller:
     ):
         community_id = community["vk_id"]
 
-        content = vk.extract_post_content(post)
-        content["author_link"] = vk.get_author_link(post, community_id)
-        content["post_link"] = vk.get_post_link(community_id, post["id"])
+        content = VKClient.extract_post_content(post)
+        content["author_link"] = VKClient.get_author_link(post, community_id)
+        content["post_link"] = VKClient.get_post_link(community_id, post["id"])
         content["community_name"] = community.get("name", "")
 
         content_json = json.dumps(content, ensure_ascii=False)
