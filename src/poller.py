@@ -117,6 +117,22 @@ class VKPoller:
         if community.get("suggested_topic_id"):
             await self._poll_wall(vk, community, "suggested")
 
+    # ── Entry point for the Long Poll listener (long_poll.py) ────────────────
+
+    async def handle_new_published_post(self, vk_id: int, post: dict) -> None:
+        """Called by long_poll.py when VK delivers a wall_post_new event."""
+        community = await self.db.get_community(vk_id)
+        if not community:
+            logger.warning(f"Long Poll wall_post_new for unknown community {vk_id}, ignoring.")
+            return
+        topic_id = community.get("published_topic_id")
+        if not topic_id:
+            return
+        last_known_id = community.get("last_post_id", 0)
+        if post["id"] > last_known_id:
+            await self.db.update_community_last_id(vk_id, "published", post["id"])
+        await self._send_post(community, post, topic_id, "published")
+
     # ── Wall polling ──────────────────────────────────────────────────────────
 
     async def _poll_wall(self, vk: VKClient, community: dict, post_type: str):
