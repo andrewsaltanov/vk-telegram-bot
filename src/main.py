@@ -12,6 +12,7 @@ import schedule_board
 from config import load_config
 from database import Database
 from handlers import router
+from long_poll import run_long_poll
 from poller import VKPoller
 from scheduler import create_scheduler, init as init_scheduler, reload_pending_jobs
 from setup import setup_communities
@@ -60,22 +61,36 @@ async def main():
     # Create Telegram topics for VK communities (if not yet)
     await setup_communities(bot, db, config)
 
-    # VK polling loop
+    # VK polling loop + Long Poll listeners share one VKPoller instance — the
+    # listeners need handle_new_published_post() even when
+    # VK_POLLING_ENABLED=false, so the poller is always constructed.
+    poller = VKPoller(bot=bot, db=db, config=config, scheduler=scheduler)
     poller_task = None
     if config.POLL_ENABLED:
-        poller = VKPoller(bot=bot, db=db, config=config, scheduler=scheduler)
         poller_task = asyncio.create_task(poller.start())
     else:
         logger.warning(
             "VK polling disabled (VK_POLLING_ENABLED=false) — the bot will still "
             "handle Telegram commands and fire already-scheduled publications, "
-            "but won't fetch new VK posts."
+            "but won't fetch new VK posts. VK Bots Long Poll still runs."
         )
+
+    long_poll_tasks = [
+        asyncio.create_task(run_long_poll(comm_cfg, poller))
+        for comm_cfg in config.COMMUNITIES
+    ]
 
     logger.info("Bot is running. Press Ctrl+C to stop.")
     try:
         await dp.start_polling(bot, db=db, config=config, scheduler=scheduler)
     finally:
+        for t in long_poll_tasks:
+            t.cancel()
+        for t in long_poll_tasks:
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
         if poller_task:
             poller_task.cancel()
             try:
