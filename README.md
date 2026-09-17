@@ -77,7 +77,8 @@ python src/main.py
 | `BOT_TOKEN` | Токен бота от [@BotFather](https://t.me/BotFather) |
 | `GROUP_ID` | ID супергруппы Telegram (бот — администратор с `manage_topics`) |
 | `ADMIN_IDS` | ID администраторов бота через запятую |
-| `POLL_INTERVAL` | Интервал опроса VK в секундах (по умолчанию `300`) |
+| `POLL_INTERVAL` | Интервал опроса предложки VK в секундах (по умолчанию `1200`) |
+| `PUBLISHED_SAFETY_POLL_INTERVAL` | Редкий safety-net опрос опубликованной стены — только для проверки удалений (по умолчанию `14400`) |
 | `INITIAL_POSTS_COUNT` | Сколько постов загрузить при первом запуске (по умолчанию `10`) |
 | `TIMEZONE` | Часовой пояс для планировщика (например `Europe/Moscow`) |
 

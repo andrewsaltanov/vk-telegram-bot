@@ -31,6 +31,7 @@ class Config:
     DB_PATH: str = "/app/data/bot.db"
     TIMEZONE: str = "Europe/Moscow"
     COMMUNITIES_FILE: str = "/app/communities.json"
+    PUBLISHED_SAFETY_POLL_INTERVAL: int = 14400
 
     def get_community_config(self, group_id: int) -> CommunityConfig | None:
         for c in self.COMMUNITIES:
@@ -78,9 +79,13 @@ def load_config() -> Config:
         GROUP_ID=int(os.environ["GROUP_ID"]),
         ADMIN_IDS=admin_ids,
         COMMUNITIES=communities,
-        # VK's Sept 2026 policy caps unverified apps at 10,000 API calls/month —
-        # each cycle burns 2 wall.get calls per community, so 300s was ~5x over budget.
-        POLL_INTERVAL=int(os.environ.get("POLL_INTERVAL", "3600")),
+        # POLL_INTERVAL now only paces the "suggested" queue (no VK event
+        # exists for it under any transport). Published posts arrive via VK
+        # Bots Long Poll instead (see long_poll.py); PUBLISHED_SAFETY_POLL_INTERVAL
+        # below is just a slow safety net for deletion detection and catching
+        # anything a Long Poll reconnect gap missed.
+        POLL_INTERVAL=int(os.environ.get("POLL_INTERVAL", "1200")),
+        PUBLISHED_SAFETY_POLL_INTERVAL=int(os.environ.get("PUBLISHED_SAFETY_POLL_INTERVAL", "14400")),
         POLL_ENABLED=os.environ.get("VK_POLLING_ENABLED", "true").strip().lower() not in ("0", "false", "no"),
         INITIAL_POSTS_COUNT=int(os.environ.get("INITIAL_POSTS_COUNT", "10")),
         DB_PATH=os.environ.get("DB_PATH", "/app/data/bot.db"),
