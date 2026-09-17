@@ -28,13 +28,13 @@ async def _get_long_poll_session(
             timeout=aiohttp.ClientTimeout(total=15),
         ) as resp:
             data = await resp.json()
+        if "error" in data:
+            logger.error(f"groups.getLongPollServer failed for group {group_id}: {data['error']}")
+            return None
+        return data["response"]
     except Exception as e:
         logger.warning(f"groups.getLongPollServer network error for group {group_id}: {e}")
         return None
-    if "error" in data:
-        logger.error(f"groups.getLongPollServer failed for group {group_id}: {data['error']}")
-        return None
-    return data["response"]
 
 
 async def run_long_poll(comm_cfg, poller) -> None:
@@ -65,25 +65,35 @@ async def run_long_poll(comm_cfg, poller) -> None:
                 await asyncio.sleep(RECONNECT_DELAY_SECONDS)
                 continue
 
-            failed = data.get("failed")
-            if failed == 1:
-                # History gap — VK supplies a fresh ts to resume from, same session.
+            try:
+                failed = data.get("failed")
+                if failed == 1:
+                    # History gap — VK supplies a fresh ts to resume from, same session.
+                    lp_session["ts"] = data["ts"]
+                    continue
+                if failed in (2, 3):
+                    # Key expired (2) or session data lost (3) — both need a fresh session.
+                    logger.info(
+                        f"Long Poll session for group {group_id} expired (failed={failed}), reconnecting"
+                    )
+                    lp_session = None
+                    continue
+                if failed:
+                    logger.error(f"Long Poll unexpected failure for group {group_id}: {data}")
+                    lp_session = None
+                    await asyncio.sleep(RECONNECT_DELAY_SECONDS)
+                    continue
+
                 lp_session["ts"] = data["ts"]
-                continue
-            if failed in (2, 3):
-                # Key expired (2) or session data lost (3) — both need a fresh session.
-                logger.info(
-                    f"Long Poll session for group {group_id} expired (failed={failed}), reconnecting"
-                )
-                lp_session = None
-                continue
-            if failed:
-                logger.error(f"Long Poll unexpected failure for group {group_id}: {data}")
+                updates = data.get("updates", [])
+            except Exception as e:
+                # Valid JSON but the wrong shape (e.g. not a dict, or missing
+                # expected keys) — treat like a network/protocol error.
+                logger.warning(f"Long Poll malformed response for group {group_id}: {e}")
                 lp_session = None
                 await asyncio.sleep(RECONNECT_DELAY_SECONDS)
                 continue
 
-            lp_session["ts"] = data["ts"]
-            for update in data.get("updates", []):
+            for update in updates:
                 if update.get("type") == "wall_post_new":
                     await poller.handle_new_published_post(group_id, update.get("object", {}))
