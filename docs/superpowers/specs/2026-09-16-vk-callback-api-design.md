@@ -1,3 +1,11 @@
+> **Superseded 2026-09-17** — replaced by
+> `docs/superpowers/specs/2026-09-17-vk-long-poll-design.md`. VK's Bots Long
+> Poll API delivers the identical event catalog (including `wall_post_new`)
+> using the community token already in `communities.json`, with no public
+> HTTPS endpoint, domain, certificate, or nginx config required. No code from
+> this document was ever implemented (the implementation attempt was aborted
+> before Task 1). Kept for history only.
+
 # VK Callback API for published-post detection
 
 ## Problem

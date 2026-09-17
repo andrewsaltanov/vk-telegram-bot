@@ -1,3 +1,10 @@
+> **Superseded 2026-09-17 — never executed.** The design it implements
+> (`docs/superpowers/specs/2026-09-16-vk-callback-api-design.md`) was
+> replaced by a VK Long Poll design before Task 1 was dispatched — the
+> execution worktree was discarded with zero commits. See
+> `docs/superpowers/plans/2026-09-17-vk-long-poll.md` for the current plan.
+> Kept for history only.
+
 # VK Callback API for Published Posts — Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
