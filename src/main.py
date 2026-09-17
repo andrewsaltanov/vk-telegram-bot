@@ -61,26 +61,27 @@ async def main():
     # Create Telegram topics for VK communities (if not yet)
     await setup_communities(bot, db, config)
 
-    # VK polling loop + Long Poll listeners share one VKPoller instance — the
-    # listeners need handle_new_published_post() to exist, but neither is
-    # actually started when VK_POLLING_ENABLED=false, so constructing the
-    # poller unconditionally is moot in that case.
+    # VK Bots Long Poll uses each community's own group token (not the shared
+    # VK_USER_TOKEN wall.get relies on), so it's independent of VK_POLLING_ENABLED
+    # and keeps running even while the wall.get-based poller is paused (e.g. the
+    # user token got flood-controlled/blocked account-wide) — the listeners only
+    # need handle_new_published_post() on the poller instance, not poller.start().
     poller = VKPoller(bot=bot, db=db, config=config, scheduler=scheduler)
     poller_task = None
-    long_poll_tasks = []
     if config.POLL_ENABLED:
         poller_task = asyncio.create_task(poller.start())
-        long_poll_tasks = [
-            asyncio.create_task(run_long_poll(comm_cfg, poller))
-            for comm_cfg in config.COMMUNITIES
-        ]
     else:
         logger.warning(
-            "VK polling disabled (VK_POLLING_ENABLED=false) — the bot will still "
-            "handle Telegram commands and fire already-scheduled publications, "
-            "but won't fetch new VK posts: both the wall.get poll and VK Bots "
-            "Long Poll are off."
+            "VK wall.get polling disabled (VK_POLLING_ENABLED=false) — the "
+            "suggested-queue poll and published safety-net poll (deletion "
+            "detection) are off, but VK Bots Long Poll still delivers new "
+            "published posts, and the bot still handles Telegram commands and "
+            "fires already-scheduled publications."
         )
+    long_poll_tasks = [
+        asyncio.create_task(run_long_poll(comm_cfg, poller))
+        for comm_cfg in config.COMMUNITIES
+    ]
 
     logger.info("Bot is running. Press Ctrl+C to stop.")
     try:
