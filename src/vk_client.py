@@ -92,6 +92,13 @@ class VKClient:
 
     # ── Wall posts ────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _drop_ad_items(items: List[dict]) -> List[dict]:
+        """wall.get now interleaves native ad slots (type == "ads") into the
+        item list — they carry no "id"/"date"/post content, just ad metadata,
+        and crash any code that assumes every item is a real wall post."""
+        return [item for item in items if "id" in item]
+
     async def get_wall_posts(
         self, community_id: int, count: int = 50, offset: int = 0
     ) -> Optional[List[dict]]:
@@ -119,7 +126,7 @@ class VKClient:
         )
         if result is None:
             return None
-        return result.get("items", [])
+        return self._drop_ad_items(result.get("items", []))
 
     async def get_suggested_posts(
         self, community_id: int, count: int = 50, offset: int = 0
@@ -144,7 +151,7 @@ class VKClient:
         )
         if result is None:
             return None
-        return result.get("items", [])
+        return self._drop_ad_items(result.get("items", []))
 
     async def post_exists(self, community_id: int, post_id: int) -> bool:
         result = await self._call(
